@@ -1,7 +1,10 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState, useRef, useCallback } from "react";
 import "./InterviewRoom.css";
 import { createDefaultWebRTCManager } from "../utils/webrtc";
 import ReportModal from "./ReportModal";
+import AIInterviewerPanel from "./AIInterviewerPanel";
+import AIInterviewQA from "./AIInterviewQA";
+import { useInterviewerMode } from "./InterviewModeContext";
 
 function InterviewRoom({ room, onLeave }) {
   const [aiResults, setAiResults] = useState({
@@ -43,14 +46,47 @@ function InterviewRoom({ room, onLeave }) {
   const [sessionStartTime, setSessionStartTime] = useState(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [signalingConnected, setSignalingConnected] = useState(false);
+  
+  // Enhanced AI Interviewer states
+  const [aiInterviewerActive, setAiInterviewerActive] = useState(false);
+  const [aiInterviewerStatus, setAiInterviewerStatus] = useState("idle");
+  const [currentQuestion, setCurrentQuestion] = useState("");
+  const [candidateResponse, setCandidateResponse] = useState("");
+  const [questionHistory, setQuestionHistory] = useState([]);
+  const [responseAnalysis, setResponseAnalysis] = useState(null);
+  const [resumeData, setResumeData] = useState(null);
+  const [showAIConfigModal, setShowAIConfigModal] = useState(false);
+  const [aiInterviewerConfig, setAiInterviewerConfig] = useState({
+    difficulty: "medium",
+    duration: 30,
+    questionTypes: ["technical", "behavioral", "resume_based"],
+    enableFollowUps: true,
+    enableVoiceQuestions: true
+  });
+  const [connectionRetryCount, setConnectionRetryCount] = useState(0);
+  const [isExplicitlyClosing, setIsExplicitlyClosing] = useState(false);
+
+  // ✅ USE INTERVIEWER MODE FROM CONTEXT
+  const { 
+    mode: interviewMode, 
+    setMode: setInterviewMode, 
+    syncModes, 
+    syncStatus,
+    breakSync
+  } = useInterviewerMode();
 
   const videoRef = useRef(null);
   const participantVideoRef = useRef(null);
   const wsRef = useRef(null);
+  const aiWsRef = useRef(null);
   const chatMessagesRef = useRef(null);
   const canvasRef = useRef(null);
   const frameIntervalRef = useRef(null);
   const webrtcManagerRef = useRef(null);
+  const ttsAudioRef = useRef(null);
+  const modeSyncTimeoutRef = useRef(null);
+  const connectionMonitorRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
 
   const PYTHON_API_URL = 'http://localhost:8001';
   const NODE_API_URL = 'http://localhost:8000/api';
@@ -59,6 +95,10 @@ function InterviewRoom({ room, onLeave }) {
   const updateConnectionStatus = (status) => {
     console.log(`🔗 Interviewer connection status updating to: ${status}`);
     setConnectionStatus(status);
+    
+    if (status === 'connected') {
+      setConnectionRetryCount(0);
+    }
   };
 
   const calculateDuration = () => {
@@ -71,32 +111,84 @@ function InterviewRoom({ room, onLeave }) {
     return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
   };
 
-  // Enhanced performance calculation
   const calculatePerformanceScore = (detectionData) => {
-    let score = 50; // Base score
+    let score = 50;
     
-    // Positive factors
-    if (detectionData.faces === 1) score += 15; // Single face detection
-    if (detectionData.eye_moves < 10) score += 10; // Good eye contact
-    if (detectionData.lipsync) score += 10; // Good lip sync
-    if (!detectionData.bg_voice) score += 5; // No background noise
-    if (detectionData.speech) score += 5; // Speech detected
+    if (detectionData.faces === 1) score += 15;
+    if (detectionData.eye_moves < 10) score += 10;
+    if (detectionData.lipsync) score += 10;
+    if (!detectionData.bg_voice) score += 5;
+    if (detectionData.speech) score += 5;
     if (detectionData.mood === 'happy' || detectionData.mood === 'neutral') score += 5;
     
-    // Negative factors
-    if (detectionData.faces === 0) score -= 20; // No face detected
-    if (detectionData.faces > 1) score -= 15; // Multiple faces
-    if (detectionData.eye_moves > 30) score -= 10; // Too many eye movements
-    if (detectionData.face_alert) score -= 10; // Face verification failed
-    if (detectionData.bg_voice) score -= 10; // Background voice detected
+    if (detectionData.faces === 0) score -= 20;
+    if (detectionData.faces > 1) score -= 15;
+    if (detectionData.eye_moves > 30) score -= 10;
+    if (detectionData.face_alert) score -= 10;
+    if (detectionData.bg_voice) score -= 10;
     
-    // Ensure score is within bounds
     return Math.max(0, Math.min(100, score));
   };
 
-  // Enhanced message handling
+  const handleWebSocketMessage = (data) => {
+    console.log('📡 WebSocket message received:', data.type);
+    
+    if (data.type === 'ping') {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'pong' }));
+      }
+      return;
+    }
+    
+    if (data.type === 'connection_established') {
+      console.log('✅ WebSocket connection established');
+      return;
+    }
+    
+    if (data.type === 'command_response') {
+      console.log('✅ Command response:', data);
+      return;
+    }
+    
+    if (data.faces !== undefined) {
+      console.log('🎯 Detection data received:', {
+        faces: data.faces,
+        mood: data.mood,
+        gender: data.gender,
+        speech: data.speech
+      });
+      
+      const enhancedData = {
+        faces: data.faces || 0,
+        eye_moves: data.eye_moves || 0,
+        face_alert: data.face_alert || "",
+        gender: data.gender || "Unknown",
+        mood: data.mood || "neutral",
+        bg_voice: data.bg_voice || false,
+        lipsync: data.lipsync || false,
+        verification: referenceFaceSet ? "Reference Set" : (data.verification || "Not set"),
+        speech: data.speech || false,
+        mouth_ratio: data.mouth_ratio || 0,
+        interview_active: data.interview_active || false
+      };
+      
+      setAiResults(prev => {
+        const hasChanged = JSON.stringify(prev) !== JSON.stringify(enhancedData);
+        if (hasChanged) {
+          console.log('🔄 Updating AI results:', enhancedData);
+          return enhancedData;
+        }
+        return prev;
+      });
+      
+      if (currentSessionId && (enhancedData.faces > 0 || enhancedData.speech)) {
+        saveDetectionData(enhancedData);
+      }
+    }
+  };
+
   const handleWebRTCMessage = (data) => {
-    console.log('📨 Received WebRTC message:', data.type, data.fromDataChannel ? '(data channel)' : '(signaling)');
+    console.log('📨 Received WebRTC message:', data.type);
     
     switch (data.type) {
       case 'chat':
@@ -106,22 +198,28 @@ function InterviewRoom({ room, onLeave }) {
         );
         
         if (!messageExists) {
-          console.log('💬 Adding chat message:', data.message);
           addMessage(data.message, data.sender, data.timestamp, data.id);
         }
         break;
         
       case 'screen_share_state':
-        console.log('🖥️ Participant screen share state:', data.isSharing);
         setIsParticipantScreenSharing(data.isSharing);
         break;
         
       case 'ai_results':
         console.log('🤖 AI results from participant:', data.data);
+        if (data.data) {
+          setAiResults(prev => ({
+            ...prev,
+            faces: data.data.faces || prev.faces,
+            mood: data.data.mood || prev.mood,
+            gender: data.data.gender || prev.gender,
+            speech: data.data.speech || prev.speech
+          }));
+        }
         break;
         
       case 'data_channel_state':
-        console.log('💬 Data channel state:', data.channel, data.state);
         if (data.channel === 'chat' && data.state === 'open') {
           setChatConnected(true);
         } else if (data.channel === 'chat' && data.state === 'closed') {
@@ -129,17 +227,323 @@ function InterviewRoom({ room, onLeave }) {
         }
         break;
         
+      case 'resume_uploaded':
+        console.log('📄 Resume uploaded notification from participant:', data);
+        
+        const newResumeData = {
+          text: data.resume_text,
+          originalFile: data.original_file || null,
+          fileType: data.file_type || null,
+          fileExtension: data.file_extension || null,
+          uploadedAt: new Date().toISOString(),
+          filename: data.filename,
+          roomId: data.room_id || room.id,
+          manualMode: data.manual_mode || false
+        };
+        setResumeData(newResumeData);
+        
+        addMessage(`📄 Participant uploaded resume: ${data.filename || 'resume.txt'}`, 'system', new Date().toISOString());
+        
+        if (data.resume_text && data.room_id) {
+          console.log('📤 Syncing resume to Python backend...');
+          
+          const formData = new FormData();
+          formData.append('session_id', currentSessionId || `manual-${Date.now()}`);
+          formData.append('room_id', data.room_id || room.id);
+          formData.append('resume_text', data.resume_text || 'Resume uploaded by participant');
+          
+          fetch(`${PYTHON_API_URL}/manual_upload_resume`, {
+            method: "POST",
+            body: formData,
+          })
+          .then(response => response.json())
+          .then(result => {
+            console.log('✅ Resume synced to Python backend:', result);
+            addMessage("✅ Resume synchronized with AI system", 'system', new Date().toISOString());
+            
+            if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+              webrtcManagerRef.current.sendData('chat', {
+                type: 'resume_sync_complete',
+                message: 'Resume ready for AI interview',
+                room_id: data.room_id || room.id,
+                timestamp: new Date().toISOString()
+              });
+            }
+          })
+          .catch(err => {
+            console.error('❌ Failed to sync resume to Python backend:', err);
+            addMessage("⚠️ Failed to sync resume with AI system", 'system', new Date().toISOString());
+          });
+        }
+        break;
+        
+      case 'participant_connected':
+        setActiveParticipants(1);
+        if (interviewMode === 'manual') {
+          addMessage("✅ Participant connected. You can now start the interview.", 'system', new Date().toISOString());
+        }
+        break;
+        
+      case 'interview_mode_update':
+        console.log('🔄 Mode update from participant:', data.mode, data.syncResponse);
+        
+        if (data.syncResponse === "accepted") {
+          console.log('✅ Participant accepted mode sync');
+          syncModes(data.mode);
+          
+          addMessage(
+            `✅ Participant synchronized to ${data.mode === "ai" ? "AI" : "Manual"} mode.`, 
+            'system', 
+            new Date().toISOString()
+          );
+          
+          if (modeSyncTimeoutRef.current) {
+            clearTimeout(modeSyncTimeoutRef.current);
+            modeSyncTimeoutRef.current = null;
+          }
+          
+          handleModeTransition(data.mode);
+          
+        } else if (data.syncResponse === "rejected") {
+          console.log('❌ Participant rejected mode sync');
+          breakSync();
+          
+          addMessage(
+            `⚠️ Participant rejected mode sync. Modes are now independent.`, 
+            'system', 
+            new Date().toISOString()
+          );
+          
+          if (modeSyncTimeoutRef.current) {
+            clearTimeout(modeSyncTimeoutRef.current);
+            modeSyncTimeoutRef.current = null;
+          }
+          
+        } else if (data.syncRequest && data.source === 'participant') {
+          console.log('📥 Participant requesting mode change to:', data.mode);
+          handleParticipantModeRequest(data.mode, data.reason);
+        }
+        break;
+        
+      case 'resume_sync_complete':
+        console.log('✅ Resume sync complete notification:', data.message);
+        addMessage(data.message || 'Resume synchronized', 'system', new Date().toISOString());
+        break;
+        
+      case 'ai_question':
+        console.log('📝 Direct AI question received:', data.question);
+        if (aiInterviewerActive) {
+          setCurrentQuestion(data.question);
+          addMessage(data.question, 'ai_interviewer', new Date().toISOString());
+        }
+        break;
+        
+      case 'request_ai_question':
+        console.log('📥 Participant requesting AI question');
+        
+        if (currentQuestion) {
+          if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+            webrtcManagerRef.current.sendData('chat', {
+              type: 'ai_question',
+              question: currentQuestion,
+              question_index: questionHistory.length - 1,
+              total_questions: 5,
+              timestamp: new Date().toISOString(),
+              session_id: currentSessionId,
+              room_id: room.id,
+              is_resend: true
+            });
+          }
+        } else if (questionHistory.length > 0) {
+          const lastQuestion = questionHistory[questionHistory.length - 1];
+          if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+            webrtcManagerRef.current.sendData('chat', {
+              type: 'ai_question',
+              question: lastQuestion,
+              question_index: questionHistory.length - 1,
+              total_questions: 5,
+              timestamp: new Date().toISOString(),
+              session_id: currentSessionId,
+              room_id: room.id,
+              is_resend: true
+            });
+          }
+        }
+        
+        addMessage("🔄 Resent AI question to participant", 'system', new Date().toISOString());
+        break;
+        
       default:
         console.log('📨 Unknown message type:', data.type);
     }
   };
 
-  // Enhanced WebRTC initialization
+  const handleParticipantModeRequest = (requestedMode, reason = "") => {
+    const confirmMessage = `Participant wants to switch to ${requestedMode === "ai" ? "AI" : "Manual"} mode.${reason ? `\nReason: ${reason}` : ''}\n\nAccept this mode change?`;
+    
+    if (window.confirm(confirmMessage)) {
+      setInterviewMode(requestedMode, true);
+      
+      if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+        webrtcManagerRef.current.sendData('chat', {
+          type: 'interview_mode_update',
+          mode: requestedMode,
+          timestamp: new Date().toISOString(),
+          syncResponse: "accepted",
+          source: 'interviewer'
+        });
+      }
+      
+      addMessage(
+        `✅ Accepted participant's request for ${requestedMode === "ai" ? "AI" : "Manual"} mode.`, 
+        'system', 
+        new Date().toISOString()
+      );
+      
+    } else {
+      if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+        webrtcManagerRef.current.sendData('chat', {
+          type: 'interview_mode_update',
+          mode: interviewMode,
+          timestamp: new Date().toISOString(),
+          syncResponse: "rejected",
+          reason: "Interviewer rejected",
+          source: 'interviewer'
+        });
+      }
+      
+      addMessage(
+        `❌ Rejected participant's mode change request.`, 
+        'system', 
+        new Date().toISOString()
+      );
+    }
+  };
+
+  const updateVideoChatVisibility = (newMode, oldMode) => {
+    console.log(`🔄 Updating video and chat visibility: ${oldMode} → ${newMode}`);
+    
+    if (newMode === "ai" && oldMode === "manual") {
+      console.log("📹 Hiding interviewer video, showing chat");
+      
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+      
+      if (!showChat) {
+        console.log("💬 Opening chat panel for AI mode");
+        setShowChat(true);
+      }
+      
+      if (isScreenSharing) {
+        stopScreenShare();
+      }
+      
+    } else if (newMode === "manual" && oldMode === "ai") {
+      console.log("📹 Showing interviewer video, closing chat");
+      
+      if (showChat) {
+        console.log("💬 Closing chat panel for manual mode");
+        setShowChat(false);
+      }
+      
+      if (mediaStream && isCameraOn && !isScreenSharing && videoRef.current) {
+        console.log("📹 Restoring interviewer video");
+        
+        videoRef.current.srcObject = mediaStream;
+        videoRef.current.classList.add('mirror-effect');
+        
+        const playVideo = () => {
+          if (videoRef.current) {
+            videoRef.current.play().catch(error => {
+              console.warn('Video play failed:', error);
+              setTimeout(playVideo, 500);
+            });
+          }
+        };
+        
+        playVideo();
+      } else if (!mediaStream && isCameraOn) {
+        console.log("⚠️ Media stream missing but camera is on");
+        setTimeout(() => {
+          if (isCameraOn && !mediaStream) {
+            startCamera();
+          }
+        }, 1000);
+      }
+      
+      if (isScreenSharing) {
+        stopScreenShare();
+      }
+    }
+  };
+
+  const handleModeTransition = (newMode) => {
+    const oldMode = interviewMode;
+    console.log(`🔄 Handling mode transition from ${oldMode} to ${newMode}`);
+    
+    updateVideoChatVisibility(newMode, oldMode);
+    
+    if (newMode === "ai") {
+      if (interviewStatus === "active") {
+        setAiInterviewerActive(true);
+        
+        addMessage(
+          "🤖 AI Interviewer activated. Click 'Start AI Interview' to begin.", 
+          'system', 
+          new Date().toISOString()
+        );
+      }
+      
+    } else {
+      if (aiInterviewerActive) {
+        console.log("🛑 Stopping AI Interviewer during mode transition");
+        stopAIInterview();
+      }
+      
+      addMessage(
+        "👨‍💼 Switching to manual mode. You are now in control of the interview.", 
+        'system', 
+        new Date().toISOString()
+      );
+      
+      if (webrtcManagerRef.current) {
+        webrtcManagerRef.current.sendChatMessage(
+          "👋 I'm taking over the interview now. Let's continue manually.",
+          `sys-${Date.now()}`
+        );
+      }
+      
+      initializeManualMode();
+      
+      setTimeout(() => {
+        if (videoRef.current && mediaStream && isCameraOn && !isScreenSharing) {
+          console.log("🔄 Forcing video refresh after mode switch");
+          videoRef.current.srcObject = null;
+          setTimeout(() => {
+            if (videoRef.current && mediaStream) {
+              videoRef.current.srcObject = mediaStream;
+              videoRef.current.classList.add('mirror-effect');
+              videoRef.current.play().catch(console.warn);
+            }
+          }, 100);
+        }
+      }, 500);
+    }
+  };
+
   const initializeWebRTCManager = () => {
     const user = JSON.parse(localStorage.getItem('interviewUser'));
     const userId = user?.id || 'interviewer-' + Date.now();
     
-    console.log('🚀 Initializing WebRTC manager for interviewer...');
+    console.log(`🚀 Initializing WebRTC manager for interviewer in ${interviewMode} mode...`);
+    
+    if (webrtcManagerRef.current) {
+      console.log('🛑 Cleaning up existing WebRTC manager');
+      webrtcManagerRef.current.isClosed = true;
+      webrtcManagerRef.current.close();
+      webrtcManagerRef.current = null;
+    }
     
     webrtcManagerRef.current = createDefaultWebRTCManager(
       room.id, 
@@ -155,12 +559,42 @@ function InterviewRoom({ room, onLeave }) {
               setChatConnected(true);
               setIsConnecting(false);
               console.log('✅ WebRTC connected with participant!');
+              
+              if (!webrtcManagerRef.current.isDataChannelOpen('chat')) {
+                webrtcManagerRef.current.createDataChannel('chat', {
+                  ordered: true,
+                  maxRetransmits: 3
+                });
+                console.log('💬 Chat data channel created');
+              }
+              
+              if (webrtcManagerRef.current?.isDataChannelOpen('chat')) {
+                webrtcManagerRef.current.sendData('chat', {
+                  type: 'interview_mode_update',
+                  mode: interviewMode,
+                  timestamp: new Date().toISOString()
+                });
+              }
+              
+              if (interviewMode === 'ai') {
+                if (!showChat) setShowChat(true);
+                if (videoRef.current && videoRef.current.srcObject) {
+                  videoRef.current.srcObject = null;
+                }
+              } else {
+                if (showChat) setShowChat(false);
+              }
+              
+              if (interviewMode === 'manual' && webrtcManagerRef.current?.isDataChannelOpen('chat')) {
+                setTimeout(() => {
+                  addMessage("👋 Welcome! I'm your interviewer. Let's begin the interview.", 'interviewer', new Date().toISOString());
+                }, 1000);
+              }
               break;
               
             case 'connecting':
               updateConnectionStatus("connecting");
               setIsConnecting(true);
-              console.log('🔄 Connecting to participant...');
               break;
               
             case 'disconnected':
@@ -168,24 +602,13 @@ function InterviewRoom({ room, onLeave }) {
               updateConnectionStatus("disconnected");
               setIsConnecting(false);
               setChatConnected(false);
-              console.log('❌ WebRTC connection lost');
               break;
-              
-            default:
-              console.log('🔗 WebRTC state:', state);
           }
         },
         
-        onIceConnectionStateChange: (state) => {
-          console.log('🧊 Interviewer ICE connection state:', state);
-        },
-        
         onTrack: (event) => {
-          console.log('🎥 Interviewer received remote track from participant:', event.track.kind, event.streams);
-          
           if (event.streams && event.streams.length > 0) {
             const remoteStream = event.streams[0];
-            console.log('🔗 Setting participant stream:', remoteStream.id);
             setParticipantStream(remoteStream);
             setActiveParticipants(1);
             
@@ -193,7 +616,6 @@ function InterviewRoom({ room, onLeave }) {
               if (participantVideoRef.current && remoteStream) {
                 participantVideoRef.current.srcObject = remoteStream;
                 participantVideoRef.current.play().catch(error => {
-                  console.warn('⚠️ Failed to play participant video, retrying...', error);
                   setTimeout(setupVideo, 500);
                 });
               }
@@ -204,38 +626,46 @@ function InterviewRoom({ room, onLeave }) {
         },
         
         onMessage: (data) => {
-          console.log('📨 Interviewer received message:', data.type);
           handleWebRTCMessage(data);
         },
         
         onDataChannel: (channel) => {
-          console.log('💬 Data channel created:', channel.label);
           if (channel.label === 'chat') {
+            console.log('💬 Chat data channel opened');
             setChatConnected(true);
+            
+            setTimeout(() => {
+              if (interviewMode === 'manual') {
+                webrtcManagerRef.current.sendChatMessage(
+                  "👋 Hello! I'm ready to start the interview.",
+                  `welcome-${Date.now()}`
+                );
+              }
+            }, 1000);
           }
         },
         
         onParticipantJoined: (data) => {
-          console.log('👤 Participant joined room:', data.participantId);
           setActiveParticipants(1);
           setIsConnecting(true);
           updateConnectionStatus("connecting");
           
           setTimeout(async () => {
-            if (webrtcManagerRef.current) {
-              console.log('🎯 Creating offer for participant...');
-              await webrtcManagerRef.current.createOffer();
+            if (webrtcManagerRef.current && !webrtcManagerRef.current.isClosed) {
+              try {
+                await webrtcManagerRef.current.createOffer();
+              } catch (error) {
+                console.error('❌ Failed to create offer:', error);
+              }
             }
-          }, 1000);
+          }, 1500);
         },
         
         onOpen: () => {
-          console.log('✅ Interviewer signaling connected');
           setSignalingConnected(true);
         },
         
         onClose: () => {
-          console.log('🔌 Interviewer signaling closed');
           setSignalingConnected(false);
           setChatConnected(false);
         },
@@ -244,61 +674,68 @@ function InterviewRoom({ room, onLeave }) {
           console.error('❌ Interviewer WebRTC error:', error);
           updateConnectionStatus("error");
           setIsConnecting(false);
+        },
+        
+        onPeerDisconnected: (data) => {
+          console.log('👋 Peer disconnected:', data);
+          setActiveParticipants(0);
+          setParticipantStream(null);
+          updateConnectionStatus("disconnected");
+          setChatConnected(false);
+          addMessage("👋 Participant has left the room", 'system', new Date().toISOString());
         }
       }
     );
   };
 
-  // Enhanced WebSocket connection
   const connectWebSocket = () => {
+    if (isExplicitlyClosing) return;
+    
     try {
       if (wsRef.current) {
         wsRef.current.close();
+        wsRef.current = null;
       }
       
+      console.log('🔌 Connecting to AI WebSocket...');
       const ws = new WebSocket("ws://localhost:8001/ws");
       
       ws.onopen = () => {
-        console.log("✅ Interviewer connected to AI WebSocket");
+        console.log("✅ Connected to AI WebSocket");
         setAiConnected(true);
+        setConnectionRetryCount(0);
         
-        if (participantVideoRef.current && interviewStatus === "active") {
-          if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
-          frameIntervalRef.current = setInterval(captureAndSendFrame, 1000);
+        if (currentSessionId) {
+          const registerMsg = {
+            type: 'command',
+            command: 'register_session',
+            session_id: currentSessionId,
+            room_id: room.id
+          };
+          console.log('📤 Registering session:', registerMsg);
+          ws.send(JSON.stringify(registerMsg));
         }
+        
+        setTimeout(() => {
+          if (participantVideoRef.current && interviewStatus === "active") {
+            if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+            frameIntervalRef.current = setInterval(captureAndSendFrame, 1000);
+            console.log('🎥 Started frame capture interval');
+          }
+        }, 1000);
       };
       
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          console.log("🤖 Interviewer AI Analysis Data:", data);
-          
-          const enhancedData = {
-            faces: data.faces || 0,
-            eye_moves: data.eye_moves || 0,
-            face_alert: data.face_alert || "",
-            gender: data.gender || "Unknown",
-            mood: data.mood || "neutral",
-            bg_voice: data.bg_voice || false,
-            lipsync: data.lipsync || false,
-            verification: data.verification || "Not set",
-            speech: data.speech || false,
-            mouth_ratio: data.mouth_ratio || 0,
-            interview_active: data.interview_active || false
-          };
-          
-          setAiResults(prev => ({ ...prev, ...enhancedData }));
-          
-          if (currentSessionId && enhancedData.faces > 0) {
-            saveDetectionData(enhancedData);
-          }
+          handleWebSocketMessage(data);
         } catch (err) {
-          console.error("❌ Error parsing AI data:", err);
+          console.error("❌ Error parsing WebSocket message:", err);
         }
       };
       
       ws.onclose = (event) => {
-        console.log("🔌 Interviewer AI WebSocket disconnected:", event.code, event.reason);
+        console.log("🔌 AI WebSocket disconnected:", event.code, event.reason);
         setAiConnected(false);
         
         if (frameIntervalRef.current) {
@@ -306,29 +743,411 @@ function InterviewRoom({ room, onLeave }) {
           frameIntervalRef.current = null;
         }
         
-        if (interviewStatus === "active") {
-          console.log("🔄 Reconnecting to AI WebSocket in 3 seconds...");
-          setTimeout(() => connectWebSocket(), 3000);
+        if (interviewStatus === "active" && !isExplicitlyClosing && connectionRetryCount < 3) {
+          const delay = Math.min(3000 * (connectionRetryCount + 1), 15000);
+          console.log(`🔄 Reconnecting WebSocket in ${delay}ms... (attempt ${connectionRetryCount + 1})`);
+          setConnectionRetryCount(prev => prev + 1);
+          setTimeout(() => connectWebSocket(), delay);
         }
       };
       
       ws.onerror = (error) => {
-        console.error("❌ Interviewer AI WebSocket error:", error);
+        console.error("❌ AI WebSocket error:", error);
         setAiConnected(false);
       };
       
       wsRef.current = ws;
+      
     } catch (err) {
-      console.error("❌ Interviewer WebSocket connection failed:", err);
+      console.error("❌ WebSocket connection failed:", err);
       setAiConnected(false);
     }
   };
 
-  // Enhanced camera start
+  const connectToAIInterviewer = () => {
+    if (isExplicitlyClosing) return;
+    
+    try {
+      if (aiWsRef.current) {
+        aiWsRef.current.close();
+      }
+      
+      const ws = new WebSocket("ws://localhost:8001/ws");
+      
+      ws.onopen = () => {
+        console.log("✅ Connected to AI Interviewer WebSocket");
+        setAiInterviewerStatus("connected");
+        
+        if (currentSessionId) {
+          ws.send(JSON.stringify({
+            type: 'command',
+            command: 'register_session',
+            session_id: currentSessionId,
+            room_id: room.id
+          }));
+        }
+      };
+      
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          
+          if (data.type === 'ai_interview_started') {
+            console.log('🤖 AI interview started');
+            addMessage("🤖 AI Interview started with participant", 'system', new Date().toISOString());
+            
+            if (data.questions && data.questions.length > 0) {
+              setCurrentQuestion(data.questions[0]);
+              setQuestionHistory([data.questions[0]]);
+              addMessage(data.questions[0], 'ai_interviewer', new Date().toISOString());
+              
+              if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+                console.log('📤 Sending first question to participant via WebRTC');
+                webrtcManagerRef.current.sendData('chat', {
+                  type: 'ai_question',
+                  question: data.questions[0],
+                  question_index: 0,
+                  total_questions: data.questions.length,
+                  timestamp: new Date().toISOString(),
+                  session_id: currentSessionId,
+                  room_id: room.id,
+                  message: 'AI Interview starting now'
+                });
+              }
+            }
+          } else if (data.type === 'ai_answer_feedback') {
+            console.log('📊 AI answer feedback:', data);
+            addMessage(`🤖 AI Score: ${data.score}/10 - ${data.feedback}`, 'system', new Date().toISOString());
+            
+            if (data.next_question) {
+              setCurrentQuestion(data.next_question);
+              setQuestionHistory(prev => [...prev, data.next_question]);
+              addMessage(data.next_question, 'ai_interviewer', new Date().toISOString());
+              
+              if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+                console.log('📤 Sending next question to participant via WebRTC');
+                webrtcManagerRef.current.sendData('chat', {
+                  type: 'ai_question',
+                  question: data.next_question,
+                  question_index: questionHistory.length,
+                  total_questions: data.total_questions || 5,
+                  timestamp: new Date().toISOString(),
+                  session_id: currentSessionId,
+                  room_id: room.id
+                });
+              }
+            }
+            
+            if (data.final_results) {
+              addMessage(`🎉 AI Interview Completed! Score: ${data.final_results.percentage}% - ${data.final_results.verdict}`, 'system', new Date().toISOString());
+              setAiInterviewerStatus("complete");
+            }
+          } else if (data.type === 'ai_interview_error') {
+            console.error('❌ AI Interview Error:', data.message);
+            addMessage(`❌ AI Error: ${data.message}`, 'system', new Date().toISOString());
+            setAiInterviewerStatus("error");
+          }
+        } catch (err) {
+          console.error("❌ Error parsing AI Interviewer data:", err);
+        }
+      };
+      
+      ws.onclose = () => {
+        console.log("🔌 AI Interviewer WebSocket disconnected");
+        setAiInterviewerStatus("disconnected");
+      };
+      
+      ws.onerror = (error) => {
+        console.error("❌ AI Interviewer WebSocket error:", error);
+        setAiInterviewerStatus("error");
+      };
+      
+      aiWsRef.current = ws;
+    } catch (err) {
+      console.error("❌ AI Interviewer WebSocket connection failed:", err);
+      setAiInterviewerStatus("error");
+    }
+  };
+
+  const playTTSAudio = (text) => {
+    if (!aiInterviewerConfig.enableVoiceQuestions) return;
+    
+    if ('speechSynthesis' in window) {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      utterance.volume = 1.0;
+      utterance.lang = 'en-US';
+      
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length > 0) {
+        const preferredVoice = voices.find(voice => 
+          voice.lang.includes('en') && !voice.name.includes('Microsoft')
+        );
+        if (preferredVoice) {
+          utterance.voice = preferredVoice;
+        }
+      }
+      
+      window.speechSynthesis.speak(utterance);
+    }
+  };
+
+  const startResumeBasedAIInterview = async () => {
+    if (!resumeData || !currentSessionId) {
+      alert("Resume not available or session not ready");
+      return;
+    }
+
+    if (interviewMode !== "ai") {
+      alert("Please switch to AI mode first");
+      return;
+    }
+
+    try {
+      console.log('🤖 Starting resume-based AI interview...');
+      
+      setAiInterviewerActive(true);
+      setAiInterviewerStatus("starting");
+      
+      const response = await fetch(
+        `${PYTHON_API_URL}/start_ai_interview?session_id=${currentSessionId}&level=medium&room_id=${room.id}`,
+        { 
+          method: "POST",
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          }
+        }
+      );
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('❌ AI interview start failed:', errorText);
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
+      }
+      
+      const result = await response.json();
+      console.log('✅ AI Interview started:', result);
+      
+      await connectToAIInterviewer();
+      
+      if (result.questions && result.questions.length > 0) {
+        const firstQuestion = result.questions[0];
+        console.log('📝 Setting and sending first question:', firstQuestion);
+        
+        setCurrentQuestion(firstQuestion);
+        setQuestionHistory([firstQuestion]);
+        addMessage(firstQuestion, 'ai_interviewer', new Date().toISOString());
+        
+        if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+          console.log('📤 Sending AI question to participant via WebRTC');
+          webrtcManagerRef.current.sendData('chat', {
+            type: 'ai_question',
+            question: firstQuestion,
+            question_index: 0,
+            total_questions: result.questions.length,
+            timestamp: new Date().toISOString(),
+            session_id: currentSessionId,
+            room_id: room.id,
+            message: 'AI Interview starting now'
+          });
+        }
+        
+        if (webrtcManagerRef.current) {
+          webrtcManagerRef.current.sendChatMessage(
+            `🤖 AI Question 1/5: ${firstQuestion}`,
+            `aiq-${Date.now()}`
+          );
+        }
+      }
+      
+      addMessage("🤖 AI Interview started based on participant's resume!", 'system', new Date().toISOString());
+      setAiInterviewerStatus("speaking");
+      
+      alert("✅ AI interview started! Participant will now receive AI questions.");
+      
+      setTimeout(() => {
+        setAiInterviewerStatus("listening");
+        addMessage("👂 Waiting for participant response...", 'system', new Date().toISOString());
+      }, 3000);
+      
+    } catch (error) {
+      console.error('❌ Error starting AI interview:', error);
+      setAiInterviewerActive(false);
+      setAiInterviewerStatus("error");
+      
+      alert(`Failed to start AI interview:\n\n${error.message}`);
+    }
+  };
+
+  const startAIInterview = async () => {
+    if (!aiInterviewerActive || interviewMode !== 'ai') return;
+    
+    try {
+      console.log('🤖 Starting AI Interview...');
+      setAiInterviewerStatus("starting");
+      
+      connectToAIInterviewer();
+      connectWebSocket();
+      
+    } catch (error) {
+      console.error('❌ Error starting AI interview:', error);
+      setAiInterviewerStatus("error");
+    }
+  };
+
+  const stopAIInterview = () => {
+    console.log('🛑 Stopping AI Interview...');
+    setAiInterviewerActive(false);
+    setAiInterviewerStatus("idle");
+    
+    if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+      webrtcManagerRef.current.sendData('chat', {
+        type: 'ai_interviewer_stop',
+        timestamp: new Date().toISOString(),
+        message: 'AI Interview stopped by interviewer'
+      });
+    }
+    
+    if (currentSessionId) {
+      fetch(`${PYTHON_API_URL}/end_ai_interview?session_id=${currentSessionId}`, {
+        method: "POST",
+      })
+      .catch(error => {
+        console.error('❌ Error ending AI interview on backend:', error);
+      });
+    }
+    
+    if (aiWsRef.current) {
+      aiWsRef.current.close();
+    }
+    
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    
+    setCurrentQuestion("");
+    setCandidateResponse("");
+    setQuestionHistory([]);
+    setResponseAnalysis(null);
+  };
+
+  const toggleAIInterviewer = () => {
+    if (aiInterviewerActive) {
+      stopAIInterview();
+    } else {
+      if (resumeData) {
+        startResumeBasedAIInterview();
+      } else {
+        alert("No resume uploaded yet. Ask participant to upload resume first.");
+      }
+    }
+  };
+
+  const handleDynamicModeSwitch = async (newMode) => {
+    if (newMode === interviewMode) return;
+    
+    console.log(`🔄 Attempting dynamic mode switch from ${interviewMode} to ${newMode}`);
+    
+    if (interviewStatus === "active") {
+      const confirmMessage = `Switch to ${newMode === "ai" ? "AI" : "Manual"} mode?\n\nThis will: ${
+        newMode === "ai" 
+          ? "Hide your video, open chat panel, and activate AI Interviewer"
+          : "Show your video, close chat panel, and return to manual control"
+      }\n\nThis will affect both you and the participant.`;
+      
+      if (!window.confirm(confirmMessage)) {
+        return;
+      }
+    }
+    
+    try {
+      setInterviewMode(newMode, true);
+      
+      addMessage(
+        `🔄 Switching to ${newMode === "ai" ? "AI" : "Manual"} mode...`, 
+        'system', 
+        new Date().toISOString()
+      );
+      
+      if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+        webrtcManagerRef.current.sendData('chat', {
+          type: 'interview_mode_update',
+          mode: newMode,
+          timestamp: new Date().toISOString(),
+          syncRequest: true,
+          source: 'interviewer',
+          reason: "Interviewer initiated mode change"
+        });
+      }
+      
+      if (modeSyncTimeoutRef.current) {
+        clearTimeout(modeSyncTimeoutRef.current);
+      }
+      
+      modeSyncTimeoutRef.current = setTimeout(() => {
+        if (syncStatus === "requested") {
+          console.warn("⏰ Mode sync timeout - participant may not have responded");
+          addMessage(
+            "⚠️ Mode sync timeout. Participant may still be in previous mode.", 
+            'system', 
+            new Date().toISOString()
+          );
+          breakSync();
+        }
+      }, 10000);
+      
+      handleModeTransition(newMode);
+      
+      setTimeout(() => {
+        addMessage(
+          `✅ Successfully switched to ${newMode === "ai" ? "AI" : "Manual"} mode.`, 
+          'system', 
+          new Date().toISOString()
+        );
+      }, 1000);
+      
+    } catch (error) {
+      console.error("❌ Error switching mode:", error);
+      
+      addMessage(
+        `❌ Failed to switch mode: ${error.message}`, 
+        'system', 
+        new Date().toISOString()
+      );
+      
+      alert(`Failed to switch mode: ${error.message}`);
+    }
+  };
+
+  const handleInterviewModeChange = (newMode) => {
+    console.log(`🔄 Mode change requested: ${newMode}`);
+    
+    if (newMode === interviewMode) {
+      console.log("⚠️ Already in this mode");
+      return;
+    }
+    
+    if (interviewStatus === "active") {
+      handleDynamicModeSwitch(newMode);
+    } else {
+      console.log(`🔄 Setting interview mode to ${newMode}`);
+      setInterviewMode(newMode);
+      
+      updateVideoChatVisibility(newMode, interviewMode);
+      
+      if (newMode === "ai") {
+        setShowAIConfigModal(true);
+      }
+    }
+  };
+
   const startCamera = async () => {
     try {
       console.log('🎥 Interviewer starting camera...');
       setIsConnecting(true);
+      setIsExplicitlyClosing(false);
       
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { 
@@ -344,14 +1163,12 @@ function InterviewRoom({ room, onLeave }) {
         }
       });
       
-      console.log('✅ Interviewer camera stream obtained');
       setMediaStream(stream);
       
-      if (videoRef.current) {
+      if (videoRef.current && interviewMode === 'manual' && !(interviewMode === 'ai' && aiInterviewerActive)) {
         videoRef.current.srcObject = stream;
         videoRef.current.classList.add('mirror-effect');
         videoRef.current.onloadedmetadata = () => {
-          console.log('✅ Interviewer video ready');
           videoRef.current.play().catch(console.warn);
         };
       }
@@ -359,22 +1176,28 @@ function InterviewRoom({ room, onLeave }) {
       setIsCameraOn(true);
       setIsMicOn(true);
       
-      // Initialize WebRTC manager and connect to signaling
       initializeWebRTCManager();
+      
       if (webrtcManagerRef.current) {
         await webrtcManagerRef.current.connect();
         await webrtcManagerRef.current.setLocalStream(stream);
         
         webrtcManagerRef.current.createDataChannel('chat', {
-          ordered: true
+          ordered: true,
+          maxRetransmits: 3
         });
       }
       
-      // Create session after media is ready
       await createSession();
       
       console.log('✅ Interviewer camera started successfully');
       setIsConnecting(false);
+      
+      const welcomeMessage = interviewMode === 'ai' 
+        ? "🎥 Camera started. Waiting for participant to join..."
+        : "🎥 Camera started. You are now hosting the interview room. Share the Room ID with the participant.";
+      addMessage(welcomeMessage, 'system', new Date().toISOString());
+      
     } catch (err) {
       console.error("❌ Interviewer error accessing media devices:", err);
       alert("Could not access camera. Please check permissions.");
@@ -383,28 +1206,50 @@ function InterviewRoom({ room, onLeave }) {
     }
   };
 
-  // Enhanced cleanup
   const stopCamera = () => {
     console.log('🛑 Interviewer stopping camera...');
+    setIsExplicitlyClosing(true);
     
-    // Clear intervals
     if (frameIntervalRef.current) {
       clearInterval(frameIntervalRef.current);
       frameIntervalRef.current = null;
     }
     
-    // Close WebSockets
+    if (modeSyncTimeoutRef.current) {
+      clearTimeout(modeSyncTimeoutRef.current);
+      modeSyncTimeoutRef.current = null;
+    }
+    
+    if (connectionMonitorRef.current) {
+      clearInterval(connectionMonitorRef.current);
+      connectionMonitorRef.current = null;
+    }
+    
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    
     if (wsRef.current) {
       wsRef.current.close();
       setAiConnected(false);
     }
     
-    // Close WebRTC manager
-    if (webrtcManagerRef.current) {
-      webrtcManagerRef.current.close();
+    if (aiWsRef.current) {
+      aiWsRef.current.close();
+      setAiInterviewerStatus("disconnected");
     }
     
-    // Stop media streams
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    
+    if (webrtcManagerRef.current) {
+      webrtcManagerRef.current.isClosed = true;
+      webrtcManagerRef.current.close();
+      webrtcManagerRef.current = null;
+    }
+    
     if (mediaStream) {
       mediaStream.getTracks().forEach(track => track.stop());
     }
@@ -413,7 +1258,6 @@ function InterviewRoom({ room, onLeave }) {
       screenStream.getTracks().forEach(track => track.stop());
     }
     
-    // Reset video elements
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
@@ -421,7 +1265,6 @@ function InterviewRoom({ room, onLeave }) {
       participantVideoRef.current.srcObject = null;
     }
     
-    // Reset states
     setIsCameraOn(false);
     setIsMicOn(false);
     setIsScreenSharing(false);
@@ -432,15 +1275,42 @@ function InterviewRoom({ room, onLeave }) {
     setChatConnected(false);
     setSignalingConnected(false);
     setIsConnecting(false);
+    setAiInterviewerActive(false);
+    setAiInterviewerStatus("idle");
+    setResumeData(null);
+    setConnectionRetryCount(0);
+    setIsExplicitlyClosing(false);
     
     console.log('✅ Interviewer camera stopped');
   };
 
-  // Enhanced interview start
+  const initializeManualMode = () => {
+    console.log('👨‍💼 Initializing manual interview mode...');
+    
+    if (webrtcManagerRef.current && !webrtcManagerRef.current.isClosed) {
+      if (!webrtcManagerRef.current.isDataChannelOpen('chat')) {
+        webrtcManagerRef.current.createDataChannel('chat', {
+          ordered: true,
+          maxRetransmits: 3
+        });
+      }
+      
+      const checkConnection = setInterval(() => {
+        if (connectionStatus === 'connected' && chatConnected && !isExplicitlyClosing) {
+          clearInterval(checkConnection);
+          setTimeout(() => {
+            addMessage("👋 Hello! Welcome to the interview. I'll be conducting your interview today.", 'interviewer', new Date().toISOString());
+          }, 1000);
+        }
+      }, 1000);
+    }
+  };
+
   const startInterview = async () => {
     try {
-      console.log('🎬 Interviewer starting interview process...');
+      console.log(`🎬 Starting interview in ${interviewMode} mode...`);
       setIsConnecting(true);
+      setIsExplicitlyClosing(false);
       
       await startCamera();
       
@@ -451,29 +1321,48 @@ function InterviewRoom({ room, onLeave }) {
         return;
       }
       
-      // Start AI analysis
       connectWebSocket();
       
-      // Notify Python backend
       try {
-        const response = await fetch(`${PYTHON_API_URL}/start_interview`, {
+        const response = await fetch(`${PYTHON_API_URL}/start_interview?session_id=${sessionId}&room_id=${room.id}`, {
           method: "POST",
           headers: { 'Content-Type': 'application/json' }
         });
         
         if (response.ok) {
-          const result = await response.json();
-          if (result.status === "success") {
-            setInterviewStatus("active");
-            console.log('✅ Interview started successfully!');
-          }
+          console.log('✅ Python backend interview session started');
+        } else {
+          console.warn('⚠️ Could not start interview on Python backend');
         }
       } catch (err) {
         console.warn('⚠️ Could not connect to Python backend, continuing without it');
       }
       
+      if (interviewMode === 'ai') {
+        if (!showChat) setShowChat(true);
+        if (videoRef.current && videoRef.current.srcObject) {
+          videoRef.current.srcObject = null;
+        }
+        
+        addMessage("🤖 AI Interviewer mode ready. Wait for participant to upload resume.", 'system', new Date().toISOString());
+      } else {
+        if (showChat) setShowChat(false);
+        addMessage("👨‍💼 Manual Interview mode activated. You are now in control of the interview.", 'system', new Date().toISOString());
+        addMessage("Share this Room ID with the participant: " + room.id, 'system', new Date().toISOString());
+        initializeManualMode();
+      }
+      
       setInterviewStatus("active");
+      setSessionStartTime(new Date());
       setIsConnecting(false);
+      
+      setTimeout(() => {
+        if (participantVideoRef.current && aiConnected && !isExplicitlyClosing) {
+          if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+          frameIntervalRef.current = setInterval(captureAndSendFrame, 1000);
+          console.log('🎥 Started frame capture interval');
+        }
+      }, 2000);
       
     } catch (err) {
       console.error("❌ Interviewer error starting interview:", err);
@@ -482,21 +1371,21 @@ function InterviewRoom({ room, onLeave }) {
     }
   };
 
-  // Enhanced interview stop
   const stopInterview = async () => {
     try {
       console.log('🛑 Interviewer stopping interview...');
+      
+      if (aiInterviewerActive) {
+        stopAIInterview();
+      }
+      
       stopCamera();
       
       try {
-        const response = await fetch(`${PYTHON_API_URL}/stop_interview`, {
+        await fetch(`${PYTHON_API_URL}/stop_interview`, {
           method: "POST",
           headers: { 'Content-Type': 'application/json' }
         });
-        const result = await response.json();
-        if (result.status === "success") {
-          console.log('✅ Python backend notified');
-        }
       } catch (err) {
         console.warn('⚠️ Could not notify Python backend');
       }
@@ -523,7 +1412,6 @@ function InterviewRoom({ room, onLeave }) {
     }
   };
 
-  // Create session with proper error handling
   const createSession = async () => {
     try {
       const user = JSON.parse(localStorage.getItem('interviewUser'));
@@ -540,7 +1428,8 @@ function InterviewRoom({ room, onLeave }) {
           sessionId: sessionId,
           roomId: room.id,
           userId: user.id,
-          userType: 'interviewer'
+          userType: 'interviewer',
+          interviewMode: interviewMode
         })
       });
       
@@ -580,30 +1469,138 @@ function InterviewRoom({ room, onLeave }) {
   };
 
   const captureAndSendFrame = () => {
-    if (!participantVideoRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    if (!participantVideoRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    
+    if (isExplicitlyClosing) return;
+    
     try {
       const video = participantVideoRef.current;
-      if (video.videoWidth === 0 || video.videoHeight === 0 || video.readyState !== 4) return;
-      if (!canvasRef.current) canvasRef.current = document.createElement('canvas');
+      
+      if (video.videoWidth === 0 || video.videoHeight === 0 || video.readyState !== 4) {
+        return;
+      }
+      
+      if (!canvasRef.current) {
+        canvasRef.current = document.createElement('canvas');
+      }
+      
       const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      
+      const imageData = canvas.toDataURL('image/jpeg', 0.8);
+      
+      const frameData = {
+        type: 'participant_frame',
+        image: imageData,
+        timestamp: Date.now(),
+        roomId: room.id,
+        sessionId: currentSessionId,
+        userId: 'interviewer'
+      };
+      
+      wsRef.current.send(JSON.stringify(frameData));
+      
+    } catch (error) {
+      console.error('❌ Error capturing frame:', error);
+      canvasRef.current = null;
+    }
+  };
+
+  const captureReferenceFace = async () => {
+    if (!participantVideoRef.current) {
+      alert("No participant video available.");
+      return;
+    }
+    
+    try {
+      setCapturingReference(true);
+      console.log('👤 Starting reference face capture...');
+      
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      const video = participantVideoRef.current;
+      if (video.videoWidth === 0 || video.videoHeight === 0) {
+        alert("Participant video not ready. Please wait for video to load.");
+        setCapturingReference(false);
+        return;
+      }
+      
+      const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const imageData = canvas.toDataURL('image/jpeg', 0.8);
-      if (wsRef.current.readyState === WebSocket.OPEN) {
-        const frameData = {
-          type: 'participant_frame',
-          image: imageData,
-          timestamp: Date.now(),
-          roomId: room.id,
-          sessionId: currentSessionId
-        };
-        wsRef.current.send(JSON.stringify(frameData));
+      
+      const imageData = canvas.toDataURL('image/jpeg', 0.9);
+      
+      const response = await fetch(`${PYTHON_API_URL}/set_reference_face`, {
+        method: "POST",
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          session_id: currentSessionId || `session-${Date.now()}`,
+          image_data: imageData
+        })
+      });
+      
+      console.log('📤 Reference face upload response status:', response.status);
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('❌ Reference face upload failed:', errorText);
+        
+        let errorMessage = `HTTP error! status: ${response.status}`;
+        try {
+          const errorData = JSON.parse(errorText);
+          errorMessage = errorData.message || errorMessage;
+        } catch (e) {
+          // Keep the default error message
+        }
+        
+        throw new Error(errorMessage);
       }
+      
+      const result = await response.json();
+      console.log('✅ Reference face capture result:', result);
+      
+      if (result.status === "success") {
+        setReferenceFaceSet(true);
+        alert('✅ Reference face captured successfully!');
+        
+        setAiResults(prev => ({
+          ...prev,
+          verification: "Reference Set"
+        }));
+      } else {
+        throw new Error(result.message || 'No face detected');
+      }
+      
     } catch (error) {
-      console.error('Error capturing frame:', error);
+      console.error('❌ Error capturing reference face:', error);
+      alert(`Error capturing reference face: ${error.message}\n\nPlease ensure participant's face is clearly visible with good lighting.`);
+    } finally {
+      setCapturingReference(false);
     }
+  };
+
+  const handleCaptureReference = async () => {
+    if (!isParticipantVideoReady()) {
+      alert("Participant video is not ready.");
+      return;
+    }
+    if (!activeParticipants) {
+      alert("No participant connected.");
+      return;
+    }
+    await captureReferenceFace();
   };
 
   const isParticipantVideoReady = () => {
@@ -612,7 +1609,6 @@ function InterviewRoom({ room, onLeave }) {
     return video.videoWidth > 0 && video.videoHeight > 0 && video.readyState >= 2;
   };
 
-  // Enhanced message handling with duplicate prevention
   const addMessage = (text, sender, timestamp, id = null) => {
     const messageId = id || Date.now() + Math.random();
     const message = {
@@ -633,7 +1629,6 @@ function InterviewRoom({ room, onLeave }) {
     if (sender === 'participant' && !showChat) setUnreadMessages(prev => prev + 1);
   };
 
-  // Enhanced message sending with retry mechanism
   const sendMessage = () => {
     if (newMessage.trim() === "") return;
     
@@ -646,16 +1641,15 @@ function InterviewRoom({ room, onLeave }) {
     addMessage(messageText, 'interviewer', timestamp, messageId);
     setUnreadMessages(0);
     
-    if (webrtcManagerRef.current) {
+    if (webrtcManagerRef.current && !webrtcManagerRef.current.isClosed) {
       const success = webrtcManagerRef.current.sendChatMessage(messageText, messageId);
       if (!success) {
-        console.warn('⚠️ Failed to send message via WebRTC, will retry...');
         setTimeout(() => {
-          webrtcManagerRef.current?.sendChatMessage(messageText, messageId);
+          if (webrtcManagerRef.current && !webrtcManagerRef.current.isClosed) {
+            webrtcManagerRef.current.sendChatMessage(messageText, messageId);
+          }
         }, 500);
       }
-    } else {
-      console.error('❌ WebRTC manager not available');
     }
     
     setNewMessage("");
@@ -687,7 +1681,6 @@ function InterviewRoom({ room, onLeave }) {
     }
   };
 
-  // FIXED: Enhanced screen sharing with consistent box sizes
   const toggleScreenShare = async () => {
     if (!isScreenSharing) {
       try {
@@ -710,24 +1703,17 @@ function InterviewRoom({ room, onLeave }) {
           }
         });
 
-        console.log('Interviewer screen stream obtained with tracks:', 
-          screenStream.getVideoTracks().length, 'video,',
-          screenStream.getAudioTracks().length, 'audio'
-        );
-
         setScreenStream(screenStream);
         
-        // Replace the camera video with screen share in the same video element
-        if (videoRef.current) {
+        if (videoRef.current && interviewMode === 'manual' && !aiInterviewerActive) {
           videoRef.current.srcObject = screenStream;
-          videoRef.current.classList.remove('mirror-effect'); // Remove mirror effect for screen share
+          videoRef.current.classList.remove('mirror-effect');
           videoRef.current.play().catch(console.warn);
         }
 
         setIsScreenSharing(true);
         
-        // Update WebRTC with screen stream
-        if (webrtcManagerRef.current) {
+        if (webrtcManagerRef.current && !webrtcManagerRef.current.isClosed) {
           const videoTrack = screenStream.getVideoTracks()[0];
           if (videoTrack) {
             await webrtcManagerRef.current.replaceVideoTrack(videoTrack);
@@ -738,11 +1724,9 @@ function InterviewRoom({ room, onLeave }) {
             await webrtcManagerRef.current.replaceAudioTrack(audioTrack);
           }
           
-          // Notify participant about screen share state
           webrtcManagerRef.current.sendScreenShareState(true);
         }
 
-        // Handle track ended events
         screenStream.getVideoTracks()[0].onended = () => {
           console.log('Screen share track ended by user');
           stopScreenShare();
@@ -761,7 +1745,6 @@ function InterviewRoom({ room, onLeave }) {
     }
   };
 
-  // FIXED: Enhanced screen share stop - restores camera
   const stopScreenShare = () => {
     console.log('🛑 Interviewer stopping screen share...');
     
@@ -773,17 +1756,15 @@ function InterviewRoom({ room, onLeave }) {
       setScreenStream(null);
     }
     
-    // Restore camera stream in the video element
-    if (videoRef.current && mediaStream) {
+    if (videoRef.current && mediaStream && interviewMode === 'manual' && !aiInterviewerActive) {
       videoRef.current.srcObject = mediaStream;
-      videoRef.current.classList.add('mirror-effect'); // Add mirror effect back for camera
+      videoRef.current.classList.add('mirror-effect');
       videoRef.current.play().catch(console.warn);
     }
     
     setIsScreenSharing(false);
     
-    // Restore WebRTC to camera stream
-    if (webrtcManagerRef.current && mediaStream) {
+    if (webrtcManagerRef.current && !webrtcManagerRef.current.isClosed && mediaStream) {
       const videoTrack = mediaStream.getVideoTracks()[0];
       if (videoTrack) {
         webrtcManagerRef.current.replaceVideoTrack(videoTrack);
@@ -794,90 +1775,49 @@ function InterviewRoom({ room, onLeave }) {
         webrtcManagerRef.current.replaceAudioTrack(audioTrack);
       }
       
-      // Notify participant about screen share stop
       webrtcManagerRef.current.sendScreenShareState(false);
     }
     
     console.log('✅ Interviewer screen share stopped');
   };
 
-  const handleCaptureReference = () => {
-    if (!isParticipantVideoReady()) {
-      alert("Participant video is not ready.");
-      return;
+  const checkConnectionHealth = useCallback(() => {
+    if (!webrtcManagerRef.current || webrtcManagerRef.current.isClosed) return 'closed';
+    
+    const status = webrtcManagerRef.current.getStatus?.();
+    console.log('🔍 Connection health check:', status);
+    
+    if (status && status.signaling === 'connected' && 
+        status.peerConnection === 'failed' && 
+        isCameraOn && interviewStatus === "active" &&
+        !webrtcManagerRef.current.isReconnecting && !isExplicitlyClosing) {
+      console.log('🔄 Restarting ICE due to failed connection...');
+      webrtcManagerRef.current.restartIce().catch(console.error);
     }
-    if (!activeParticipants) {
-      alert("No participant connected.");
-      return;
+    
+    return status?.peerConnection || 'disconnected';
+  }, [isCameraOn, interviewStatus]);
+
+  const checkChatConnection = () => {
+    if (!webrtcManagerRef.current || webrtcManagerRef.current.isClosed) return false;
+    
+    const status = webrtcManagerRef.current.getStatus?.();
+    const chatChannel = status?.dataChannels?.find(ch => ch.label === 'chat');
+    
+    if (chatChannel && chatChannel.state === 'open') {
+      return true;
     }
-    captureReferenceFace();
+    
+    if (!webrtcManagerRef.current.isDataChannelOpen('chat') && !isExplicitlyClosing) {
+      webrtcManagerRef.current.createDataChannel('chat', {
+        ordered: true,
+        maxRetransmits: 3
+      });
+    }
+    
+    return false;
   };
 
-  const captureReferenceFace = async () => {
-    if (!participantVideoRef.current) {
-      alert("No participant video available.");
-      return;
-    }
-    try {
-      setCapturingReference(true);
-      const video = participantVideoRef.current;
-      if (video.videoWidth === 0 || video.videoHeight === 0) {
-        alert("Participant video not ready.");
-        setCapturingReference(false);
-        return;
-      }
-      await new Promise(resolve => setTimeout(resolve, 500));
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      let captureSuccess = false;
-      let attempts = 0;
-      const maxAttempts = 3;
-      while (!captureSuccess && attempts < maxAttempts) {
-        try {
-          const blob = await new Promise((resolve) => {
-            canvas.toBlob(resolve, 'image/jpeg', 0.95 - (attempts * 0.1));
-          });
-          if (!blob) throw new Error('Failed to create image blob');
-          const formData = new FormData();
-          formData.append('image', blob, `reference_face_${Date.now()}.jpg`);
-          const response = await fetch(`${PYTHON_API_URL}/set_reference_face`, {
-            method: "POST",
-            body: formData
-          });
-          if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-          const result = await response.json();
-          if (result.status === "success") {
-            setReferenceFaceSet(true);
-            captureSuccess = true;
-            alert('✅ Reference face captured successfully!');
-            break;
-          } else {
-            throw new Error(result.message || 'No face detected');
-          }
-        } catch (attemptError) {
-          console.log(`Attempt ${attempts + 1} failed:`, attemptError);
-          attempts++;
-          if (attempts < maxAttempts) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          }
-        }
-      }
-      if (!captureSuccess) {
-        alert(`Failed to capture reference face after ${maxAttempts} attempts. Please ensure participant's face is clearly visible with good lighting.`);
-      }
-    } catch (error) {
-      console.error('Error capturing reference face:', error);
-      alert(`Error capturing reference face: ${error.message}`);
-    } finally {
-      setCapturingReference(false);
-    }
-  };
-
-  // Enhanced report generation with performance score
   const generateFinalReport = async () => {
     if (!currentSessionId) {
       alert("No active session found. Cannot generate report.");
@@ -905,7 +1845,13 @@ function InterviewRoom({ room, onLeave }) {
             performance_score: performanceScore
           },
           chatMessages: messages,
-          performanceScore: performanceScore
+          performanceScore: performanceScore,
+          interviewMode: interviewMode,
+          aiInterviewerData: {
+            questionHistory,
+            responseAnalysis,
+            resumeData
+          }
         })
       });
       
@@ -994,29 +1940,28 @@ function InterviewRoom({ room, onLeave }) {
   };
 
   const handleLeaveMeeting = async () => {
+    setIsExplicitlyClosing(true);
     if (interviewStatus === "active") await stopInterview();
     else if (currentSessionId) await generateFinalReport();
-    if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
-    if (screenStream) screenStream.getTracks().forEach(track => track.stop());
-    if (webrtcManagerRef.current) webrtcManagerRef.current.close();
-    if (wsRef.current) wsRef.current.close();
-    setChatConnected(false);
-    setAiConnected(false);
-    setSignalingConnected(false);
-    setIsConnecting(false);
+    
+    stopCamera();
+    
     onLeave();
   };
 
-  // Enhanced useEffect for participant video stream handling
+  const handleAIConfigSubmit = () => {
+    console.log("AI Interviewer Configuration Saved:", aiInterviewerConfig);
+    setShowAIConfigModal(false);
+    alert("AI Interviewer configuration saved!");
+  };
+
   useEffect(() => {
     if (participantStream && participantVideoRef.current) {
-      console.log('🎬 Setting up participant video element with stream');
       participantVideoRef.current.srcObject = participantStream;
       
       const playVideo = () => {
         if (participantVideoRef.current) {
           participantVideoRef.current.play().catch(error => {
-            console.warn('⚠️ Failed to play participant video, retrying...', error);
             setTimeout(playVideo, 500);
           });
         }
@@ -1025,6 +1970,18 @@ function InterviewRoom({ room, onLeave }) {
       playVideo();
     }
   }, [participantStream]);
+
+  useEffect(() => {
+    if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat') && !webrtcManagerRef.current.isClosed) {
+      webrtcManagerRef.current.sendData('chat', {
+        type: 'interview_mode_update',
+        mode: interviewMode,
+        timestamp: new Date().toISOString()
+      });
+      
+      console.log(`📤 Sent mode update to participant: ${interviewMode}`);
+    }
+  }, [interviewMode]);
 
   useEffect(() => {
     if (chatMessagesRef.current) {
@@ -1037,9 +1994,10 @@ function InterviewRoom({ room, onLeave }) {
   }, [showChat]);
 
   useEffect(() => {
-    if (isParticipantVideoReady() && aiConnected && interviewStatus === "active") {
+    if (isParticipantVideoReady() && aiConnected && interviewStatus === "active" && !isExplicitlyClosing) {
       if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
       frameIntervalRef.current = setInterval(captureAndSendFrame, 1000);
+      console.log('🎥 Started frame capture for detection');
     }
     
     return () => {
@@ -1049,13 +2007,48 @@ function InterviewRoom({ room, onLeave }) {
     };
   }, [isParticipantVideoReady(), aiConnected, interviewStatus]);
 
-  // Enhanced mount and cleanup
+  useEffect(() => {
+    if (interviewStatus === "active" && isCameraOn && !isExplicitlyClosing) {
+      connectionMonitorRef.current = setInterval(() => {
+        checkConnectionHealth();
+      }, 30000);
+    }
+    
+    return () => {
+      if (connectionMonitorRef.current) {
+        clearInterval(connectionMonitorRef.current);
+      }
+    };
+  }, [interviewStatus, isCameraOn, checkConnectionHealth]);
+
+  useEffect(() => {
+    if (connectionStatus === 'connected') {
+      const interval = setInterval(() => {
+        if (!isExplicitlyClosing) {
+          const isChatConnected = checkChatConnection();
+          setChatConnected(isChatConnected);
+        }
+      }, 3000);
+      
+      return () => clearInterval(interval);
+    }
+  }, [connectionStatus]);
+
   useEffect(() => {
     console.log('🏠 InterviewRoom mounted');
     
     return () => {
       console.log('🧹 InterviewRoom cleanup');
+      setIsExplicitlyClosing(true);
       stopCamera();
+      
+      if (modeSyncTimeoutRef.current) {
+        clearTimeout(modeSyncTimeoutRef.current);
+      }
+      
+      if (connectionMonitorRef.current) {
+        clearInterval(connectionMonitorRef.current);
+      }
     };
   }, []);
 
@@ -1067,29 +2060,100 @@ function InterviewRoom({ room, onLeave }) {
         disabled={isGeneratingReport || !currentSessionId}
         className={`generate-report-button ${isGeneratingReport ? 'generating' : ''}`}
       >
-        <span className="report-icon">{isGeneratingReport ? '⏳' : '📊'}</span>
         <span className="report-text">
-          {isGeneratingReport ? 'Generating Report...' : 'Generate Final Report'}
+          {isGeneratingReport ? 'Generating Report...' : 'Generate Report'}
         </span>
       </button>
     );
   };
 
+  const ResumePanel = () => (
+    <div className="resume-header-panel">
+      <button 
+        className={`resume-download-button ${resumeData ? 'has-resume' : 'no-resume'}`}
+        onClick={() => {
+          if (resumeData) {
+            alert(`Resume available!\n\nFilename: ${resumeData.filename}\nMode: ${resumeData.manualMode ? 'Manual' : 'AI'}\nRoom: ${resumeData.roomId}`);
+          }
+        }}
+        title={resumeData ? `Resume from participant (${resumeData.manualMode ? 'Manual' : 'AI'} mode)` : 'No resume'}
+      >
+        <span className="resume-icon">📄</span>
+        <span className="resume-text">
+          {resumeData ? 'Resume Ready' : 'No Resume'}
+        </span>
+        {resumeData?.manualMode && <span className="manual-mode-indicator">👤</span>}
+      </button>
+    </div>
+  );
+
   return (
-    <div className="interview-room">
+    <div className={`interview-room ${interviewMode === 'ai' ? 'ai-mode' : ''}`}>
       <div className="room-header">
         <div className="header-left">
-          <h2>AI Interview Room - Interviewer</h2>
+          <h2>True Hire</h2>
           <span className={`room-status ${room.isJoining ? 'joined' : 'hosting'}`}>
             {room.isJoining ? 'JOINED' : 'HOSTING'}
           </span>
           <span className={`connection-status ${connectionStatus}`}>
             {connectionStatus === 'connected' ? '● Connected' : 
-             connectionStatus === 'connecting' ? '● Connecting...' : 
-             '● Disconnected'}
+            connectionStatus === 'connecting' ? '● Connecting...' : 
+            '● Disconnected'}
           </span>
+          {syncStatus === "synced" && (
+            <span className="sync-badge">🔄 Synced</span>
+          )}
+          {syncStatus === "requested" && (
+            <span className="sync-pending-badge">⏳ Syncing...</span>
+          )}
         </div>
         <div className="header-right">
+          <ResumePanel />
+          <div className="ai-interviewer-controls">
+            <div className="mode-selector">
+              <label>Mode:</label>
+              <select 
+                value={interviewMode} 
+                onChange={(e) => handleInterviewModeChange(e.target.value)}
+                className={interviewStatus === "active" ? "active-interview-mode" : ""}
+                title={interviewStatus === "active" ? "Switch mode during interview" : "Set initial mode"}
+              >
+                <option value="manual">Manual</option>
+                <option value="ai">AI</option>
+              </select>
+              {interviewStatus === "active" && (
+                <span className="dynamic-switch-indicator" title="Dynamic mode switching enabled">
+                  🔄
+                </span>
+              )}
+            </div>
+            
+            {interviewMode === "ai" && interviewStatus === "active" && (
+              <div className="ai-controls">
+                <button
+                  onClick={toggleAIInterviewer}
+                  className={`ai-toggle-button ${aiInterviewerActive ? 'active' : ''}`}
+                  disabled={!activeParticipants || connectionStatus !== 'connected' || !resumeData}
+                  title={!resumeData ? "Wait for participant to upload resume" : "Start/Stop AI Interview"}
+                >
+                  {aiInterviewerActive ? "Stop AI" : "Start AI"}
+                </button>
+                
+                {aiInterviewerActive && (
+                  <div className="ai-status">
+                    <span className={`status-indicator ${aiInterviewerStatus}`}>
+                      {aiInterviewerStatus === 'speaking' ? "🗣️ Speaking" : 
+                      aiInterviewerStatus === 'listening' ? "👂 Listening" :
+                      aiInterviewerStatus === 'analyzing' ? "🔍 Analyzing" : 
+                      aiInterviewerStatus === 'complete' ? "✅ Complete" :
+                      aiInterviewerStatus === 'connected' ? "Connected" : "Ready"}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          
           <GenerateReportButton />
           <div className="room-id"><span>Room ID:</span><span className="room-id-value">{room.id}</span></div>
           <button className="copy-room-id-button" onClick={copyRoomId}>Copy Room ID</button>
@@ -1099,31 +2163,61 @@ function InterviewRoom({ room, onLeave }) {
       <div className="room-content">
         <div className="video-section">
           <div className="video-container">
-            {/* FIXED: Enhanced video grid with consistent sizing */}
             <div className={`video-grid ${isScreenSharing || isParticipantScreenSharing ? 'has-screen-share' : ''}`}>
               
-              {/* Interviewer Video - Always maintains consistent size */}
-              <div className={`video-tile interviewer-tile ${isScreenSharing ? 'screen-share' : ''}`}>
-                <video
-                  ref={videoRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className={`video-element ${isScreenSharing ? 'screen-share' : 'mirror-effect'}`}
-                />
+              <div className={`video-tile interviewer-tile ${isScreenSharing ? 'screen-share' : ''} ${interviewMode === 'ai' && aiInterviewerActive ? 'ai-agent-active' : ''}`}>
+                {interviewMode === 'ai' && aiInterviewerActive ? (
+                  <AIInterviewQA
+                    currentQuestion={currentQuestion}
+                    candidateResponse={candidateResponse}
+                    setCandidateResponse={setCandidateResponse}
+                    aiInterviewerStatus={aiInterviewerStatus}
+                    onSubmitAnswer={() => {}}
+                  />
+                ) : (
+                  <>
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className={`video-element ${isScreenSharing ? 'screen-share' : 'mirror-effect'} ${interviewMode === 'ai' ? 'video-hidden' : ''}`}
+                    />
+                    {interviewMode === 'ai' && (
+                      <div className="ai-mode-overlay">
+                        <div className="ai-icon">🤖</div>
+                        <div>AI Interviewer Active</div>
+                        <div className="ai-mode-hint">Chat panel is open for AI communication</div>
+                      </div>
+                    )}
+                    {!isCameraOn && !isScreenSharing && interviewMode === 'manual' && (
+                      <div className="video-overlay">
+                        <div className="camera-icon">📹</div>
+                        <div>Your camera is off</div>
+                      </div>
+                    )}
+                  </>
+                )}
+                
                 <div className="video-info">
                   <div className="participant-name">
-                    You (Interviewer) {isScreenSharing && ' - Screen Sharing'}
+                    {interviewMode === 'ai' && aiInterviewerActive ? '🤖 AI Interviewer' : 
+                     interviewMode === 'ai' ? 'AI Mode - Ready' : 'You'}
+                    {isScreenSharing && ' - Screen Sharing'}
                   </div>
                   <div className="video-status">
-                    {isMicOn ? '🎤' : '🔇'} 
-                    {isScreenSharing ? ' 🖥️ Screen Sharing • LIVE' : 
-                     isCameraOn ? ' 📹 Camera • LIVE' : ' 📷 Off'}
+                    {interviewMode === 'ai' && aiInterviewerActive && (
+                      <span className={`ai-status-badge ${aiInterviewerStatus}`}>
+                        {aiInterviewerStatus === 'speaking' && ' 🗣️ Speaking'}
+                        {aiInterviewerStatus === 'listening' && ' 👂 Listening'}
+                        {aiInterviewerStatus === 'analyzing' && ' 🔍 Analyzing'}
+                        {aiInterviewerStatus === 'complete' && ' ✅ Complete'}
+                        {aiInterviewerStatus === 'idle' && ' 🤖 Ready'}
+                      </span>
+                    )}
                   </div>
                 </div>
-                {!isCameraOn && !isScreenSharing && (
-                  <div className="video-overlay"><div className="camera-icon">📹</div><div>Your camera is off</div></div>
-                )}
+                
                 {isScreenSharing && (
                   <div className="screen-share-indicator">
                     <span>🖥️ You are sharing your screen</span>
@@ -1131,7 +2225,6 @@ function InterviewRoom({ room, onLeave }) {
                 )}
               </div>
               
-              {/* Participant Video - Always maintains consistent size */}
               <div className={`video-tile participant-tile ${isParticipantScreenSharing ? 'screen-share' : ''}`}>
                 <video
                   ref={participantVideoRef}
@@ -1143,23 +2236,28 @@ function InterviewRoom({ room, onLeave }) {
                   <div className="participant-name">
                     Participant {activeParticipants > 0 && participantStream ? 
                     (isParticipantScreenSharing ? ' - Screen Sharing' : '(Live)') : '(Offline)'}
-                  </div>
-                  <div className="video-status">
-                    {activeParticipants > 0 && participantStream ? '🔊 Live' : 'Waiting for participant...'}
-                    {isParticipantScreenSharing && ' 🖥️ Screen Sharing'}
-                    {aiConnected && activeParticipants > 0 && (
-                      <span style={{color: '#10b981', marginLeft: '5px'}}>• AI Analyzing</span>
-                    )}
+                    {aiInterviewerActive && ' 🎤 Speaking to AI'}
+                    {resumeData && ' 📄'}
                   </div>
                 </div>
                 {activeParticipants === 0 && (
-                  <div className="video-overlay"><div className="camera-icon">👤</div><div>Waiting for participant to join</div></div>
+                  <div className="video-overlay">
+                    <div className="camera-icon">👤</div>
+                    <div>Waiting for participant to join</div>
+                    <div className="room-id-hint">Share Room ID: {room.id}</div>
+                  </div>
                 )}
                 {activeParticipants > 0 && !participantStream && (
-                  <div className="video-overlay"><div className="camera-icon">📹</div><div>{isConnecting ? 'Connecting to participant video...' : 'Establishing video connection...'}</div></div>
+                  <div className="video-overlay">
+                    <div className="camera-icon">📹</div>
+                    <div>{isConnecting ? 'Connecting to participant video...' : 'Establishing video connection...'}</div>
+                  </div>
                 )}
                 {participantStream && participantVideoRef.current && participantVideoRef.current.readyState < 3 && (
-                  <div className="video-overlay"><div className="camera-icon">🔄</div><div>Loading participant video...</div></div>
+                  <div className="video-overlay">
+                    <div className="camera-icon">🔄</div>
+                    <div>Loading participant video...</div>
+                  </div>
                 )}
                 {isParticipantScreenSharing && (
                   <div className="screen-share-indicator">
@@ -1185,10 +2283,23 @@ function InterviewRoom({ room, onLeave }) {
             </div>
             
             <div className="bottom-controls">
+              {interviewMode === 'ai' && aiInterviewerActive && (
+                <div className="voice-activity-indicator">
+                  <div className={`voice-dot ${aiInterviewerStatus === 'speaking' ? 'speaking' : ''}`}></div>
+                  <div className="voice-status">
+                    {aiInterviewerStatus === 'speaking' ? 'AI Speaking' : 
+                     aiInterviewerStatus === 'listening' ? 'Listening for response' : 
+                     aiInterviewerStatus === 'complete' ? 'Interview Complete' :
+                     'Voice Ready'}
+                  </div>
+                </div>
+              )}
+              
               <button
                 onClick={toggleMic}
                 className={`control-button mic-button ${isMicOn ? 'active' : 'inactive'}`}
                 title={isMicOn ? "Mute Microphone" : "Unmute Microphone"}
+                disabled={interviewMode === 'ai' && aiInterviewerActive}
               >
                 <span className="control-icon">{isMicOn ? "🎤" : "🔇"}</span>
               </button>
@@ -1196,6 +2307,7 @@ function InterviewRoom({ room, onLeave }) {
                 onClick={toggleCamera}
                 className={`control-button camera-button ${isCameraOn ? 'active' : 'inactive'}`}
                 title={isCameraOn ? "Turn Off Camera" : "Turn On Camera"}
+                disabled={interviewMode === 'ai' && aiInterviewerActive}
               >
                 <span className="control-icon">{isCameraOn ? "📹" : "📷"}</span>
               </button>
@@ -1203,6 +2315,7 @@ function InterviewRoom({ room, onLeave }) {
                 onClick={toggleScreenShare}
                 className={`control-button share-button ${isScreenSharing ? 'active' : 'inactive'}`}
                 title={isScreenSharing ? "Stop Screen Share" : "Share Screen"}
+                disabled={interviewMode === 'ai' && aiInterviewerActive}
               >
                 <span className="control-icon">{isScreenSharing ? "🖥️" : "📤"}</span>
               </button>
@@ -1240,7 +2353,10 @@ function InterviewRoom({ room, onLeave }) {
                 ) : (
                   messages.map(message => (
                     <div key={message.id} className={`message ${message.sender}`}>
-                      <div className="message-sender">{message.sender === 'interviewer' ? 'You' : 'Participant'}</div>
+                      <div className="message-sender">
+                        {message.sender === 'interviewer' ? 'You' : 
+                        message.sender === 'ai_interviewer' ? 'AI Interviewer' : 'Participant'}
+                      </div>
                       <div className="message-text">{message.text}</div>
                       <div className="message-time">{message.timestamp}</div>
                     </div>
@@ -1270,6 +2386,10 @@ function InterviewRoom({ room, onLeave }) {
                   {chatConnected ? '🟢 Chat Online' : '🔴 Chat Offline'}
                 </span>
                 {signalingConnected && <span className="signaling-status"> | Signaling Connected</span>}
+                {syncStatus === "synced" && <span className="sync-status"> | 🔄 Mode Synced</span>}
+                {syncStatus === "requested" && <span className="sync-pending-status"> | ⏳ Waiting for participant...</span>}
+                {resumeData && <span className="resume-status"> | 📄 Resume Ready</span>}
+                {!resumeData && <span className="resume-missing"> | ⚠️ Resume Needed</span>}
               </div>
             </div>
           )}
@@ -1278,6 +2398,7 @@ function InterviewRoom({ room, onLeave }) {
             <h3 className="results-title">AI Detection Results {aiConnected ? ' 🟢' : ' 🔴'}</h3>
             <div className="detection-source">
               {referenceFaceSet && <span className="verified-badge">✓ Verified</span>}
+              {resumeData && <span className="resume-badge">📄 Resume</span>}
             </div>
             <div className="results-grid">
               <div className="result-item"><span className="result-label">Faces Detected</span><span className="result-value">{aiResults.faces}</span></div>
@@ -1287,8 +2408,13 @@ function InterviewRoom({ room, onLeave }) {
               <div className="result-item"><span className="result-label">Speech Detection</span><span className="result-value">{aiResults.speech ? "Detected" : "None"}</span></div>
               <div className="result-item"><span className="result-label">Lip Sync</span><span className="result-value">{aiResults.lipsync ? "Good" : "Poor"}</span></div>
               <div className="result-item"><span className="result-label">Background Voice</span><span className="result-value">{aiResults.bg_voice ? "Detected" : "None"}</span></div>
-              <div className="result-item"><span className="result-label">Mouth Activity</span><span className="result-value">{aiResults.mouth_ratio.toFixed(3)}</span></div>
-              <div className="result-item"><span className="result-label">Face Verification</span><span className="result-value">{referenceFaceSet ? "Match" : "Not Match"}</span></div>
+              <div className="result-item"><span className="result-label">Face Verification</span><span className="result-value">{referenceFaceSet ? "Reference Set" : "Not Set"}</span></div>
+              {interviewMode === 'ai' && aiInterviewerActive && (
+                <>
+                  <div className="result-item"><span className="result-label">AI Status</span><span className="result-value">{aiInterviewerStatus}</span></div>
+                  <div className="result-item"><span className="result-label">Questions Asked</span><span className="result-value">{questionHistory.length}</span></div>
+                </>
+              )}
             </div>
             {aiResults.face_alert && (
               <div className="alert-message"><strong>ALERT:</strong> {aiResults.face_alert}</div>
@@ -1299,6 +2425,11 @@ function InterviewRoom({ room, onLeave }) {
                 Participant: {activeParticipants > 0 ? 'Connected' : 'Disconnected'} | 
                 Video: {participantStream ? 'Active' : 'Inactive'} | Status: {connectionStatus}
                 {signalingConnected && ' | Signaling Connected'}
+                {resumeData && ' | Resume Uploaded'}
+                {interviewMode === 'ai' && aiInterviewerActive && ' | AI Interviewer Active'}
+                {syncStatus === "synced" && ' | Mode Synced'}
+                {syncStatus === "requested" && ' | Syncing...'}
+                {referenceFaceSet && ' | Reference Face Set'}
               </small>
             </div>
           </div>
@@ -1318,6 +2449,120 @@ function InterviewRoom({ room, onLeave }) {
         downloadReport={downloadReport}
         sendReportToParticipant={sendReportToParticipant}
       />
+      
+      {showAIConfigModal && (
+        <div className="modal-overlay">
+          <div className="modal-content ai-config-modal">
+            <div className="modal-header">
+              <h2>🤖 AI Interviewer Configuration</h2>
+              <button className="close-modal" onClick={() => setShowAIConfigModal(false)}>×</button>
+            </div>
+            <div className="modal-body">
+              <div className="config-section">
+                <label>Interview Difficulty:</label>
+                <select
+                  value={aiInterviewerConfig.difficulty}
+                  onChange={(e) =>
+                    setAiInterviewerConfig((prev) => ({
+                      ...prev,
+                      difficulty: e.target.value
+                    }))
+                  }
+                >
+                  <option value="easy">Easy</option>
+                  <option value="medium">Medium</option>
+                  <option value="hard">Hard</option>
+                </select>
+              </div>
+              <div className="config-section">
+                <label>Enable Voice Questions:</label>
+                <input
+                  type="checkbox"
+                  checked={aiInterviewerConfig.enableVoiceQuestions}
+                  onChange={(e) =>
+                    setAiInterviewerConfig((prev) => ({
+                      ...prev,
+                      enableVoiceQuestions: e.target.checked
+                    }))
+                  }
+                />
+              </div>
+              <div className="config-section">
+                <label>Enable Follow-up Questions:</label>
+                <input
+                  type="checkbox"
+                  checked={aiInterviewerConfig.enableFollowUps}
+                  onChange={(e) =>
+                    setAiInterviewerConfig((prev) => ({
+                      ...prev,
+                      enableFollowUps: e.target.checked
+                    }))
+                  }
+                />
+              </div>
+              <div className="config-section">
+                <label>Interview Duration (minutes):</label>
+                <input
+                  type="number"
+                  min="5"
+                  max="60"
+                  value={aiInterviewerConfig.duration}
+                  onChange={(e) =>
+                    setAiInterviewerConfig((prev) => ({
+                      ...prev,
+                      duration: parseInt(e.target.value) || 30
+                    }))
+                  }
+                />
+              </div>
+              <div className="config-section">
+                <label>Question Types:</label>
+                <div className="question-types">
+                  {["technical", "behavioral", "resume_based"].map((type) => (
+                    <label key={type}>
+                      <input
+                        type="checkbox"
+                        checked={aiInterviewerConfig.questionTypes.includes(type)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setAiInterviewerConfig((prev) => ({
+                              ...prev,
+                              questionTypes: [...prev.questionTypes, type]
+                            }));
+                          } else {
+                            setAiInterviewerConfig((prev) => ({
+                              ...prev,
+                              questionTypes: prev.questionTypes.filter(t => t !== type)
+                            }));
+                          }
+                        }}
+                      />
+                      {type.replace('_', ' ').toUpperCase()}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="config-note">
+                <p><strong>Note:</strong> AI Interview requires participant to upload a resume first.</p>
+                <p>Make sure participant has uploaded their resume before starting AI interview.</p>
+                <p><strong>IMPORTANT:</strong> Resumes are stored by Room ID in the backend.</p>
+                <p>Current Room ID: <strong>{room.id}</strong></p>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="cancel-button" onClick={() => {
+                setShowAIConfigModal(false);
+                setInterviewMode("manual");
+              }}>
+                Cancel
+              </button>
+              <button className="submit-button" onClick={handleAIConfigSubmit}>
+                Save Configuration & Continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
