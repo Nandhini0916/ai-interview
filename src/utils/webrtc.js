@@ -1,4 +1,4 @@
-// webrtc.js - Fixed version with stable connection handling
+// webrtc.js - Complete stable version with connection reliability fixes
 
 export class WebRTCSignaling {
   constructor(roomId, userId, role, options = {}) {
@@ -28,7 +28,7 @@ export class WebRTCSignaling {
     
     this.config = {
       reconnectAttempts: 0,
-      maxReconnectAttempts: 3,  // Reduced to prevent infinite loops
+      maxReconnectAttempts: 3,
       baseReconnectDelay: 2000,
       maxReconnectDelay: 15000,
       iceServers: [
@@ -38,7 +38,9 @@ export class WebRTCSignaling {
         { urls: 'stun:stun3.l.google.com:19302' },
         { urls: 'stun:stun4.l.google.com:19302' }
       ],
-      iceCandidatePoolSize: 10
+      iceCandidatePoolSize: 10,
+      iceGatheringTimeout: 10000,
+      connectionTimeout: 30000
     };
     
     this.isConnected = false;
@@ -47,11 +49,12 @@ export class WebRTCSignaling {
     this.isNegotiating = false;
     this.connectionEstablished = false;
     this.isReconnecting = false;
-    this.isClosed = false;  // Track explicit closure
+    this.isClosed = false;
     this.heartbeatInterval = null;
     this.lastHeartbeat = 0;
-    
+    this.iceGatheringComplete = false;
     this.pendingIceCandidates = [];
+    this.connectionTimer = null;
   }
   
   async connect() {
@@ -95,9 +98,7 @@ export class WebRTCSignaling {
           this.isConnecting = false;
           this.config.reconnectAttempts = 0;
           
-          // Start heartbeat
           this.startHeartbeat();
-          
           this.sendJoinMessage();
           
           this.onOpen();
@@ -124,7 +125,6 @@ export class WebRTCSignaling {
           
           this.onClose(event);
           
-          // Only attempt reconnect if not manually closed
           if (this.hasJoinedRoom && !this.isClosed && !event.wasClean) {
             console.log(`🔄 ${this.role} attempting reconnect...`);
             this.attemptReconnect();
@@ -154,10 +154,14 @@ export class WebRTCSignaling {
     
     this.heartbeatInterval = setInterval(() => {
       if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.sendSignalingMessage({ type: 'ping' });
-        this.lastHeartbeat = Date.now();
+        try {
+          this.sendSignalingMessage({ type: 'ping', timestamp: Date.now() });
+          this.lastHeartbeat = Date.now();
+        } catch (err) {
+          console.warn('⚠️ Failed to send ping:', err);
+        }
       }
-    }, 25000); // Send ping every 25 seconds
+    }, 30000);
   }
   
   stopHeartbeat() {
@@ -182,14 +186,12 @@ export class WebRTCSignaling {
   
   handleSignalingMessage(data) {
     try {
-      // Handle ping/pong to keep connection alive
       if (data.type === 'ping') {
         this.sendSignalingMessage({ type: 'pong', timestamp: Date.now() });
         return;
       }
       
       if (data.type === 'pong') {
-        // Heartbeat received
         return;
       }
       
@@ -246,13 +248,11 @@ export class WebRTCSignaling {
           break;
           
         case 'chat':
-          console.log('💬 Chat from:', data.sender);
           data.fromSignaling = true;
           this.onMessage && this.onMessage(data);
           break;
           
         case 'screen_share_state':
-          console.log('🖥️ Screen sharing:', data.isSharing);
           data.fromSignaling = true;
           this.onMessage && this.onMessage(data);
           break;
@@ -265,8 +265,7 @@ export class WebRTCSignaling {
         case 'offer_requested':
           if (this.role === 'interviewer') {
             console.log('📥 Participant requested new offer');
-            // Only create offer if we're in stable state
-            if (this.peerConnection && this.peerConnection.signalingState === 'stable') {
+            if (this.peerConnection && this.peerConnection.signalingState === 'stable' && !this.isClosed) {
               this.createOffer(true).catch(console.error);
             }
           }
@@ -295,9 +294,7 @@ export class WebRTCSignaling {
         return;
       }
       
-      // For renegotiation, don't recreate peer connection
       if (!isRenegotiation || !this.peerConnection) {
-        // Create or recreate peer connection
         if (this.peerConnection) {
           console.log('🔄 Closing existing peer connection');
           this.peerConnection.close();
@@ -311,7 +308,9 @@ export class WebRTCSignaling {
         throw new Error('Failed to create peer connection');
       }
       
-      // Check if we need to rollback
+      // Set connection timer
+      this.startConnectionTimer();
+      
       if (this.peerConnection.signalingState !== 'stable') {
         console.log(`⚠️ Signaling state is ${this.peerConnection.signalingState}, rolling back...`);
         await this.peerConnection.setLocalDescription({ type: 'rollback' });
@@ -321,7 +320,6 @@ export class WebRTCSignaling {
       await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
       console.log('✅ Remote description set');
       
-      // Process any pending ICE candidates
       this.processPendingIceCandidates();
       
       console.log('🎯 Creating answer...');
@@ -338,12 +336,13 @@ export class WebRTCSignaling {
       });
       
       console.log('📤 Answer sent');
+      this.clearConnectionTimer();
       
     } catch (error) {
       console.error('❌ Error handling offer:', error);
       this.onError && this.onError(error);
+      this.clearConnectionTimer();
       
-      // Request new offer if participant fails
       if (this.role === 'participant' && !this.isClosed) {
         console.log('🔄 Requesting new offer...');
         setTimeout(() => {
@@ -371,34 +370,57 @@ export class WebRTCSignaling {
       }
       
       console.log(`🎯 Setting remote description from answer${isRenegotiation ? ' (renegotiation)' : ''}`);
+      this.startConnectionTimer();
       
-      // Check current signaling state before setting remote description
       if (this.peerConnection.signalingState === 'have-local-offer') {
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
         console.log('✅ Remote description set');
       } else if (this.peerConnection.signalingState === 'stable') {
         console.log('⚠️ Signaling state is stable, ignoring answer');
+        this.clearConnectionTimer();
         return;
       } else {
         console.log(`⚠️ Unexpected signaling state: ${this.peerConnection.signalingState}`);
-        // Try to rollback and re-offer
         await this.peerConnection.setLocalDescription({ type: 'rollback' });
         await this.createOffer(true);
+        this.clearConnectionTimer();
         return;
       }
       
       this.processPendingIceCandidates();
+      this.clearConnectionTimer();
       
     } catch (error) {
       console.error('❌ Error handling answer:', error);
       this.onError && this.onError(error);
+      this.clearConnectionTimer();
       throw error;
+    }
+  }
+  
+  startConnectionTimer() {
+    if (this.connectionTimer) clearTimeout(this.connectionTimer);
+    
+    this.connectionTimer = setTimeout(() => {
+      console.warn(`⚠️ Connection establishment timeout for ${this.role}`);
+      if (this.peerConnection && this.peerConnection.connectionState !== 'connected') {
+        console.log('🔄 Restarting ICE due to timeout...');
+        this.restartIce().catch(console.error);
+      }
+    }, this.config.connectionTimeout);
+  }
+  
+  clearConnectionTimer() {
+    if (this.connectionTimer) {
+      clearTimeout(this.connectionTimer);
+      this.connectionTimer = null;
     }
   }
   
   async handleCandidate(candidate) {
     if (!candidate) {
       console.log('✅ All ICE candidates gathered');
+      this.iceGatheringComplete = true;
       return;
     }
     
@@ -409,18 +431,22 @@ export class WebRTCSignaling {
     }
     
     try {
-      // Check if remote description is set before adding ICE candidate
       if (this.peerConnection.remoteDescription && this.peerConnection.remoteDescription.type) {
-        console.log('🧊 Adding ICE candidate');
         await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
         console.log('✅ ICE candidate added');
       } else {
         console.log('⏳ Waiting for remote description, storing candidate');
         this.pendingIceCandidates.push(candidate);
+        
+        // Set timeout to clear pending candidates
+        setTimeout(() => {
+          if (this.pendingIceCandidates.includes(candidate)) {
+            this.pendingIceCandidates = this.pendingIceCandidates.filter(c => c !== candidate);
+          }
+        }, 30000);
       }
     } catch (error) {
       console.warn('⚠️ Could not add ICE candidate:', error.message);
-      // Don't store if failed
     }
   }
   
@@ -434,17 +460,11 @@ export class WebRTCSignaling {
     const candidatesToProcess = [...this.pendingIceCandidates];
     this.pendingIceCandidates = [];
     
-    candidatesToProcess.forEach(async (candidate) => {
-      try {
-        if (candidate && this.peerConnection.remoteDescription) {
-          await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-          console.log('✅ Added pending ICE candidate');
-        }
-      } catch (error) {
-        console.warn('⚠️ Failed to add pending ICE candidate:', error.message);
-        // Don't re-add to pending
-      }
-    });
+    for (const candidate of candidatesToProcess) {
+      this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
+        .then(() => console.log('✅ Added pending ICE candidate'))
+        .catch(err => console.warn('⚠️ Failed to add pending ICE candidate:', err.message));
+    }
   }
   
   sendSignalingMessage(message) {
@@ -492,7 +512,6 @@ export class WebRTCSignaling {
       
       this.setupPeerConnectionEventHandlers();
       
-      // Create data channels only for interviewer
       if (this.role === 'interviewer') {
         this.createDataChannel('chat', { 
           ordered: true,
@@ -500,7 +519,6 @@ export class WebRTCSignaling {
         });
       }
       
-      // Add local tracks if available
       if (this.localStream) {
         await this.addLocalTracks();
       }
@@ -528,10 +546,11 @@ export class WebRTCSignaling {
           console.log('🎉 WebRTC connection established!');
           this.connectionEstablished = true;
           this.isReconnecting = false;
+          this.clearConnectionTimer();
           break;
         case 'failed':
           console.log('🔄 Connection failed, attempting recovery...');
-          if (!this.isClosed) {
+          if (!this.isClosed && !this.isReconnecting) {
             this.restartIce().catch(console.error);
           }
           break;
@@ -559,10 +578,14 @@ export class WebRTCSignaling {
       console.log(`🧊 ${this.role} ICE connection state:`, state);
       this.onIceConnectionStateChange && this.onIceConnectionStateChange(state);
       
-      // Handle ICE restart
-      if (state === 'failed' && !this.isClosed) {
+      if (state === 'failed' && !this.isClosed && !this.isReconnecting) {
         console.log('🧊 ICE failed, restarting...');
         this.restartIce().catch(console.error);
+      }
+      
+      if (state === 'connected') {
+        console.log('✅ ICE connection established');
+        this.clearConnectionTimer();
       }
     };
     
@@ -575,6 +598,7 @@ export class WebRTCSignaling {
         });
       } else {
         console.log(`✅ ${this.role} ICE candidate gathering complete`);
+        this.iceGatheringComplete = true;
       }
     };
     
@@ -589,7 +613,6 @@ export class WebRTCSignaling {
       this.onDataChannel && this.onDataChannel(event.channel);
     };
     
-    // FIXED: Enhanced negotiation handler with debouncing
     this.peerConnection.onnegotiationneeded = async () => {
       console.log(`🤝 ${this.role} negotiation needed`);
       
@@ -606,10 +629,8 @@ export class WebRTCSignaling {
       this.isNegotiating = true;
       
       try {
-        // Small delay to ensure all tracks are added
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, 200));
         
-        // Check if we're in stable state and peer connection exists
         if (!this.peerConnection) {
           console.log('No peer connection, skipping negotiation');
           return;
@@ -637,10 +658,9 @@ export class WebRTCSignaling {
       } catch (error) {
         console.error('❌ Error during negotiation:', error);
       } finally {
-        // Reset negotiation flag after timeout
         setTimeout(() => {
           this.isNegotiating = false;
-        }, 3000);
+        }, 5000);
       }
     };
   }
@@ -704,6 +724,8 @@ export class WebRTCSignaling {
   
   async createOffer(iceRestart = false) {
     try {
+      this.startConnectionTimer();
+      
       if (!this.peerConnection) {
         console.log('🚀 Creating peer connection for offer');
         await this.createPeerConnection();
@@ -717,7 +739,6 @@ export class WebRTCSignaling {
       
       if (this.peerConnection.signalingState !== 'stable') {
         console.warn(`⚠️ Cannot create offer, signaling state is: ${this.peerConnection.signalingState}`);
-        // Try to rollback
         await this.peerConnection.setLocalDescription({ type: 'rollback' });
       }
       
@@ -735,11 +756,13 @@ export class WebRTCSignaling {
       });
       
       console.log('📤 Offer sent');
+      this.clearConnectionTimer();
       return offer;
     } catch (error) {
       console.error('❌ Error creating offer:', error);
       this.onError && this.onError(error);
       this.isNegotiating = false;
+      this.clearConnectionTimer();
       throw error;
     }
   }
@@ -775,7 +798,6 @@ export class WebRTCSignaling {
         return false;
       }
     } else {
-      // Fallback to signaling for critical messages
       if (channelLabel === 'chat') {
         console.log(`📤 Falling back to signaling for chat message`);
         return this.sendSignalingMessage({
@@ -801,7 +823,6 @@ export class WebRTCSignaling {
         if (existingChannel.readyState === 'open') {
           return existingChannel;
         }
-        // Close and recreate if not open
         existingChannel.close();
         this.dataChannels.delete(label);
       }
@@ -857,11 +878,14 @@ export class WebRTCSignaling {
     this.reconnectTimeout = setTimeout(async () => {
       console.log(`🔄 Executing reconnect...`);
       try {
-        // Clean up current connection first
         if (this.peerConnection) {
           this.peerConnection.close();
           this.peerConnection = null;
         }
+        
+        this.dataChannels.clear();
+        this.pendingIceCandidates = [];
+        this.iceGatheringComplete = false;
         
         await this.connect();
         this.isReconnecting = false;
@@ -877,6 +901,7 @@ export class WebRTCSignaling {
     this.isClosed = true;
     
     this.stopHeartbeat();
+    this.clearConnectionTimer();
     
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
@@ -947,8 +972,6 @@ export class WebRTCSignaling {
     
     try {
       const existingSenders = this.peerConnection.getSenders();
-      
-      // Only remove tracks that are being replaced
       const tracksToAdd = this.localStream.getTracks();
       
       for (const track of tracksToAdd) {
@@ -968,22 +991,80 @@ export class WebRTCSignaling {
     }
   }
   
-  async restartIce() {
+  async replaceVideoTrack(newTrack) {
     if (!this.peerConnection) return;
     
     try {
+      const senders = this.peerConnection.getSenders();
+      const videoSender = senders.find(s => s.track && s.track.kind === 'video');
+      
+      if (videoSender) {
+        await videoSender.replaceTrack(newTrack);
+        console.log('✅ Replaced video track');
+      } else if (newTrack && this.localStream) {
+        this.peerConnection.addTrack(newTrack, this.localStream);
+        console.log('✅ Added video track');
+      }
+    } catch (error) {
+      console.error('❌ Error replacing video track:', error);
+    }
+  }
+  
+  async replaceAudioTrack(newTrack) {
+    if (!this.peerConnection) return;
+    
+    try {
+      const senders = this.peerConnection.getSenders();
+      const audioSender = senders.find(s => s.track && s.track.kind === 'audio');
+      
+      if (audioSender) {
+        await audioSender.replaceTrack(newTrack);
+        console.log('✅ Replaced audio track');
+      } else if (newTrack && this.localStream) {
+        this.peerConnection.addTrack(newTrack, this.localStream);
+        console.log('✅ Added audio track');
+      }
+    } catch (error) {
+      console.error('❌ Error replacing audio track:', error);
+    }
+  }
+  
+  async restartIce() {
+    if (!this.peerConnection || this.isReconnecting) return;
+    
+    try {
       console.log('🔄 Restarting ICE...');
+      this.isReconnecting = true;
+      
       const offer = await this.peerConnection.createOffer({ iceRestart: true });
       await this.peerConnection.setLocalDescription(offer);
+      
       this.sendSignalingMessage({
         type: 'offer',
         sdp: offer,
         iceRestart: true
       });
+      
       console.log('✅ ICE restart initiated');
+      
+      setTimeout(() => {
+        this.isReconnecting = false;
+      }, 5000);
     } catch (error) {
       console.error('❌ Error restarting ICE:', error);
+      this.isReconnecting = false;
     }
+  }
+  
+  sendScreenShareState(isSharing) {
+    const message = {
+      type: 'screen_share_state',
+      isSharing: isSharing,
+      timestamp: Date.now()
+    };
+    
+    this.sendData('chat', message);
+    this.sendSignalingMessage(message);
   }
   
   isDataChannelOpen(channelLabel) {
@@ -999,6 +1080,9 @@ export class WebRTCSignaling {
       signalingState: this.peerConnection ? this.peerConnection.signalingState : 'closed',
       hasJoinedRoom: this.hasJoinedRoom,
       connectionEstablished: this.connectionEstablished,
+      isReconnecting: this.isReconnecting,
+      isClosed: this.isClosed,
+      iceGatheringComplete: this.iceGatheringComplete,
       dataChannels: Array.from(this.dataChannels.entries()).map(([label, channel]) => ({
         label,
         state: channel.readyState
@@ -1065,6 +1149,18 @@ export const createDefaultWebRTCManager = (roomId, userId, role, eventHandlers =
       console.log(`👋 ${role} peer disconnected:`, data);
       if (eventHandlers.onPeerDisconnected) {
         eventHandlers.onPeerDisconnected(data);
+      }
+    },
+    onParticipantJoined: (data) => {
+      console.log(`👤 ${role} participant joined:`, data);
+      if (eventHandlers.onParticipantJoined) {
+        eventHandlers.onParticipantJoined(data);
+      }
+    },
+    onInterviewerJoined: (data) => {
+      console.log(`🎯 ${role} interviewer joined:`, data);
+      if (eventHandlers.onInterviewerJoined) {
+        eventHandlers.onInterviewerJoined(data);
       }
     },
     ...eventHandlers

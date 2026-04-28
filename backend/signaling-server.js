@@ -4,15 +4,17 @@ const path = require('path');
 
 // Server Configuration
 const SERVER_CONFIG = {
-  MAX_FILE_SIZE: 50 * 1024 * 1024, // 50MB
-  MAX_IN_MEMORY_FILE_SIZE: 5 * 1024 * 1024, // 5MB files stored in memory
-  HEARTBEAT_INTERVAL: 30000, // 30 seconds
-  HEARTBEAT_TIMEOUT: 10000, // 10 seconds
-  CLEANUP_INTERVAL: 30000, // 30 seconds
+  MAX_FILE_SIZE: 50 * 1024 * 1024,
+  MAX_IN_MEMORY_FILE_SIZE: 5 * 1024 * 1024,
+  HEARTBEAT_INTERVAL: 45000, // Increased to 45 seconds
+  HEARTBEAT_TIMEOUT: 15000, // 15 seconds
+  CLEANUP_INTERVAL: 60000, // 60 seconds
   MAX_ROOMS: 100,
   MAX_CLIENTS_PER_ROOM: 50,
   MAX_MESSAGES_HISTORY: 100,
-  FILE_RETENTION_MINUTES: 60 // Keep files for 1 hour
+  FILE_RETENTION_MINUTES: 60,
+  ICE_GATHERING_TIMEOUT: 10000, // 10 seconds for ICE gathering
+  CONNECTION_TIMEOUT: 30000 // 30 seconds for connection establishment
 };
 
 const wss = new WebSocket.Server({ 
@@ -33,7 +35,7 @@ const wss = new WebSocket.Server({
     concurrencyLimit: 10,
     threshold: 1024
   },
-  maxPayload: SERVER_CONFIG.MAX_FILE_SIZE + (1024 * 1024) // Add 1MB buffer
+  maxPayload: SERVER_CONFIG.MAX_FILE_SIZE + (1024 * 1024)
 });
 
 console.log('🚀 WebRTC Signaling Server started on port 8082');
@@ -41,19 +43,15 @@ console.log(`📊 Configuration: Max file size: ${SERVER_CONFIG.MAX_FILE_SIZE / 
 
 const rooms = new Map();
 const clients = new Map();
-
 let clientIdCounter = 0;
-
-// Store uploaded files metadata (not actual file content for large files)
 const fileMetadata = new Map();
-
-// Room lock mechanism for synchronization
 const roomLocks = new Map();
 
-// Helper function for safe message sending with retry logic
+// Track connection timeouts
+const connectionTimeouts = new Map();
+
 const safeSend = (ws, message, maxRetries = 2, retryDelay = 100) => {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    console.warn('⚠️ WebSocket not open, cannot send message');
     return false;
   }
 
@@ -84,7 +82,6 @@ const safeSend = (ws, message, maxRetries = 2, retryDelay = 100) => {
   return sendAttempt();
 };
 
-// Room locking mechanism to prevent race conditions
 async function withRoomLock(roomId, operation) {
   if (!roomLocks.has(roomId)) {
     roomLocks.set(roomId, { locked: false, queue: [] });
@@ -118,7 +115,6 @@ async function withRoomLock(roomId, operation) {
   });
 }
 
-// Enhanced heartbeat with connection monitoring
 function setupHeartbeat(ws, clientId) {
   let isAlive = true;
   let pingInterval = null;
@@ -129,27 +125,43 @@ function setupHeartbeat(ws, clientId) {
     if (pongTimeout) clearTimeout(pongTimeout);
   };
 
-  const checkConnection = () => {
-    if (!isAlive) {
-      console.warn(`⚠️ Client ${clientId} did not respond to ping, terminating`);
-      ws.terminate();
-      return;
+  const schedulePing = () => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    
+    // Send ping
+    try {
+      ws.ping(() => {});
+      ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+    } catch (err) {
+      console.warn(`⚠️ Failed to send ping to client ${clientId}:`, err.message);
     }
-
-    isAlive = false;
-    if (safeSend(ws, { type: 'ping' })) {
-      pongTimeout = setTimeout(() => {
-        if (!isAlive) {
-          console.warn(`⚠️ Client ${clientId} ping timeout`);
-          ws.terminate();
-        }
-      }, SERVER_CONFIG.HEARTBEAT_TIMEOUT);
-    }
+    
+    pongTimeout = setTimeout(() => {
+      if (!isAlive) {
+        console.warn(`⚠️ Client ${clientId} did not respond to ping, terminating`);
+        ws.terminate();
+      } else {
+        isAlive = false;
+        schedulePing();
+      }
+    }, SERVER_CONFIG.HEARTBEAT_TIMEOUT);
   };
 
   ws.on('pong', () => {
     isAlive = true;
     if (pongTimeout) clearTimeout(pongTimeout);
+  });
+
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data);
+      if (message.type === 'pong') {
+        isAlive = true;
+        if (pongTimeout) clearTimeout(pongTimeout);
+      }
+    } catch (err) {
+      // Ignore parse errors for non-JSON messages
+    }
   });
 
   ws.on('close', () => {
@@ -160,12 +172,14 @@ function setupHeartbeat(ws, clientId) {
     clearTimers();
   });
 
+  // Start the heartbeat after connection is established
   setTimeout(() => {
-    pingInterval = setInterval(checkConnection, SERVER_CONFIG.HEARTBEAT_INTERVAL);
+    if (ws.readyState === WebSocket.OPEN) {
+      schedulePing();
+    }
   }, 5000);
 }
 
-// Enhanced join handler with better state management
 async function handleJoin(ws, message, clientId) {
   const { room, role, userType, userId } = message;
   const client = clients.get(ws);
@@ -182,13 +196,11 @@ async function handleJoin(ws, message, clientId) {
 
   console.log(`👤 ${role} ${clientId} joining room ${room}`);
 
-  // Leave previous room if any
   if (client.room && client.room !== room) {
     await handleLeaveRoom(ws, client.room);
   }
 
   await withRoomLock(room, async () => {
-    // Get or create room
     let roomData = rooms.get(room);
     if (!roomData) {
       roomData = { 
@@ -198,13 +210,13 @@ async function handleJoin(ws, message, clientId) {
         interviewer: null,
         participants: [],
         messages: [],
-        files: [] // Store file metadata
+        files: [],
+        iceCandidates: [] // Store pending ICE candidates
       };
       rooms.set(room, roomData);
       console.log(`🏠 New room created: ${room}`);
     }
 
-    // Check room capacity
     if (roomData.clients.length >= SERVER_CONFIG.MAX_CLIENTS_PER_ROOM) {
       safeSend(ws, { 
         type: 'error', 
@@ -214,9 +226,15 @@ async function handleJoin(ws, message, clientId) {
       return;
     }
 
-    // Check for duplicate interviewer
+    // Clean up stale connections
+    roomData.clients = roomData.clients.filter(c => c.ws.readyState === WebSocket.OPEN);
+    if (roomData.interviewer && roomData.interviewer.ws.readyState !== WebSocket.OPEN) {
+      roomData.interviewer = null;
+    }
+    roomData.participants = roomData.participants.filter(p => p.ws.readyState === WebSocket.OPEN);
+
     if (role === 'interviewer') {
-      if (roomData.interviewer && roomData.interviewer.ws.readyState === WebSocket.OPEN) {
+      if (roomData.interviewer) {
         safeSend(ws, { 
           type: 'error', 
           message: 'Interviewer already exists in this room',
@@ -224,33 +242,23 @@ async function handleJoin(ws, message, clientId) {
         });
         return;
       }
-      // Clean up old interviewer if disconnected
-      if (roomData.interviewer && roomData.interviewer.ws.readyState !== WebSocket.OPEN) {
-        console.log('🧹 Cleaning up disconnected interviewer');
-        roomData.clients = roomData.clients.filter(c => c.ws !== roomData.interviewer.ws);
-        roomData.participants = roomData.participants.filter(p => p.ws !== roomData.interviewer.ws);
-        roomData.interviewer = null;
-      }
       roomData.interviewer = client;
     } else if (role === 'participant') {
       roomData.participants.push(client);
     }
 
-    // Update client info
     client.room = room;
     client.role = role;
     client.userType = userType || role;
     client.userId = userId || `user-${clientId}`;
     client.joinedAt = new Date().toISOString();
     
-    // Add to room clients if not already there
     if (!roomData.clients.find(c => c.ws === ws)) {
       roomData.clients.push(client);
     }
 
     console.log(`✅ ${role} ${clientId} joined room ${room}. Room now has ${roomData.clients.length} clients`);
 
-    // Send confirmation to joining client
     safeSend(ws, { 
       type: 'joined', 
       room: room,
@@ -260,7 +268,7 @@ async function handleJoin(ws, message, clientId) {
       timestamp: Date.now()
     });
 
-    // Notify other clients about the new joiner
+    // Notify other clients
     setTimeout(() => {
       roomData.clients.forEach(otherClient => {
         if (otherClient.ws !== ws && otherClient.ws.readyState === WebSocket.OPEN) {
@@ -281,20 +289,11 @@ async function handleJoin(ws, message, clientId) {
               timestamp: Date.now()
             });
           }
-          
-          safeSend(otherClient.ws, {
-            type: 'peer_joined',
-            room: room,
-            role: role,
-            peerId: clientId,
-            userId: client.userId,
-            timestamp: Date.now()
-          });
         }
       });
     }, 100);
 
-    // Send current room state to the new client
+    // Send room state to new client
     const roomState = {
       type: 'room_state',
       room: room,
@@ -307,16 +306,15 @@ async function handleJoin(ws, message, clientId) {
           userId: c.userId,
           joinedAt: c.joinedAt
         })),
-      files: roomData.files.filter(f => f.canDownload !== false), // Send available files
+      files: roomData.files.filter(f => f.canDownload !== false),
       totalClients: roomData.clients.length,
       timestamp: Date.now()
     };
     
     safeSend(ws, roomState);
 
-    // Send recent messages to new client
+    // Send recent messages
     if (roomData.messages.length > 0) {
-      console.log(`📨 Sending ${Math.min(roomData.messages.length, SERVER_CONFIG.MAX_MESSAGES_HISTORY)} recent messages to new client`);
       roomData.messages.slice(-SERVER_CONFIG.MAX_MESSAGES_HISTORY).forEach(msg => {
         safeSend(ws, {
           type: 'chat',
@@ -335,7 +333,6 @@ async function handleJoin(ws, message, clientId) {
   });
 }
 
-// Enhanced WebRTC message handling
 function handleWebRTCMessage(senderWs, message, senderId) {
   const client = clients.get(senderWs);
   if (!client || !client.room) {
@@ -347,13 +344,11 @@ function handleWebRTCMessage(senderWs, message, senderId) {
   const roomData = rooms.get(client.room);
   if (!roomData) {
     console.warn(`⚠️ Room ${client.room} not found`);
-    safeSend(senderWs, { type: 'error', message: 'Room not found' });
     return;
   }
 
   console.log(`🔄 Forwarding ${message.type} from ${client.role} ${senderId} in room ${client.room}`);
 
-  let sentCount = 0;
   let targetClients = [];
   
   if (message.type === 'offer') {
@@ -365,7 +360,7 @@ function handleWebRTCMessage(senderWs, message, senderId) {
       }
       targetClients = roomData.participants;
     } else {
-      console.warn(`⚠️ Offer can only be sent by interviewer, but sent by ${client.role}`);
+      console.warn(`⚠️ Offer can only be sent by interviewer`);
       safeSend(senderWs, { type: 'error', message: 'Only interviewer can send offers' });
       return;
     }
@@ -379,7 +374,7 @@ function handleWebRTCMessage(senderWs, message, senderId) {
         return;
       }
     } else {
-      console.warn(`⚠️ Answer can only be sent by participant, but sent by ${client.role}`);
+      console.warn(`⚠️ Answer can only be sent by participant`);
       safeSend(senderWs, { type: 'error', message: 'Only participant can send answers' });
       return;
     }
@@ -402,9 +397,20 @@ function handleWebRTCMessage(senderWs, message, senderId) {
     return;
   }
 
-  if (message.type === 'ice-candidate' && !message.candidate) {
-    console.warn('⚠️ ICE candidate message missing candidate field');
-    return;
+  // Store ICE candidates if remote description not set
+  if (message.type === 'ice-candidate' && message.candidate) {
+    const candidateKey = `${client.room}-${client.role}`;
+    if (!roomData.iceCandidates) roomData.iceCandidates = [];
+    roomData.iceCandidates.push({
+      candidate: message.candidate,
+      targetRole: targetClients[0]?.role,
+      timestamp: Date.now()
+    });
+    
+    // Clean old candidates
+    roomData.iceCandidates = roomData.iceCandidates.filter(c => 
+      Date.now() - c.timestamp < 30000
+    );
   }
 
   targetClients.forEach(targetClient => {
@@ -417,26 +423,12 @@ function handleWebRTCMessage(senderWs, message, senderId) {
         targetRole: targetClient.role
       };
       
-      if (safeSend(targetClient.ws, forwardedMessage)) {
-        sentCount++;
-        console.log(`📤 Forwarded ${message.type} to ${targetClient.role} ${targetClient.id}`);
-      } else {
-        console.warn(`⚠️ Failed to forward ${message.type} to ${targetClient.role} ${targetClient.id}`);
-      }
+      safeSend(targetClient.ws, forwardedMessage);
+      console.log(`📤 Forwarded ${message.type} to ${targetClient.role}`);
     }
   });
-
-  console.log(`📤 ${message.type} forwarded to ${sentCount} clients`);
-  
-  if (sentCount === 0) {
-    safeSend(senderWs, { 
-      type: 'warning', 
-      message: `No clients available to receive ${message.type}` 
-    });
-  }
 }
 
-// Enhanced chat message handling
 function handleChatMessage(senderWs, message, senderId) {
   const client = clients.get(senderWs);
   if (!client || !client.room) {
@@ -446,22 +438,14 @@ function handleChatMessage(senderWs, message, senderId) {
   }
 
   const roomData = rooms.get(client.room);
-  if (!roomData) {
-    console.warn(`⚠️ Room ${client.room} not found`);
-    return;
-  }
+  if (!roomData) return;
 
   const messageText = message.message || message.text;
-  if (!messageText || messageText.trim() === '') {
-    console.warn('⚠️ Empty chat message');
-    return;
-  }
+  if (!messageText || messageText.trim() === '') return;
 
   const truncatedMessage = messageText.length > 1000 
     ? messageText.substring(0, 1000) + '...' 
     : messageText;
-
-  console.log(`💬 Processing chat message from ${client.role} ${senderId}: ${truncatedMessage.substring(0, 50)}...`);
 
   const chatMessage = {
     type: 'chat',
@@ -498,316 +482,16 @@ function handleChatMessage(senderWs, message, senderId) {
     delivered: true,
     deliveredTo: sentCount
   });
-
-  console.log(`💬 Chat from ${client.role} ${senderId} delivered to ${sentCount} clients via signaling`);
 }
 
-// File upload handling with memory management
-async function handleFileUpload(ws, message, clientId) {
-  const client = clients.get(ws);
-  if (!client || !client.room) {
-    console.warn(`⚠️ Client ${clientId} not in a room, cannot upload file`);
-    safeSend(ws, { type: 'error', message: 'You must join a room first' });
-    return;
-  }
-
-  const roomData = rooms.get(client.room);
-  if (!roomData) {
-    console.warn(`⚠️ Room ${client.room} not found`);
-    return;
-  }
-
-  const { fileName, fileSize, fileType, fileId, action, chunk, totalChunks, chunkIndex } = message;
-  
-  // Validate file size
-  if (fileSize > SERVER_CONFIG.MAX_FILE_SIZE) {
-    console.warn(`⚠️ File too large: ${fileName} (${fileSize} bytes)`);
-    safeSend(ws, { 
-      type: 'error', 
-      message: `File too large. Maximum size is ${SERVER_CONFIG.MAX_FILE_SIZE / (1024 * 1024)}MB`
-    });
-    return;
-  }
-
-  if (action === 'start') {
-    console.log(`📁 Client ${clientId} starting file upload: ${fileName} (${fileSize} bytes)`);
-    
-    const isSmallFile = fileSize <= SERVER_CONFIG.MAX_IN_MEMORY_FILE_SIZE;
-    
-    const fileData = {
-      fileId,
-      fileName,
-      fileSize,
-      fileType,
-      uploaderId: clientId,
-      uploaderUserId: client.userId,
-      uploaderRole: client.role,
-      room: client.room,
-      totalChunks,
-      uploadedAt: new Date().toISOString(),
-      status: 'uploading',
-      // Store chunks in memory only for small files
-      chunks: isSmallFile ? [] : null,
-      chunkReceived: 0,
-      canDownload: isSmallFile
-    };
-    
-    fileMetadata.set(fileId, fileData);
-    
-    // Only store in room files if it's a small file that can be downloaded
-    if (fileData.canDownload) {
-      roomData.files.push(fileData);
-    }
-    
-    safeSend(ws, {
-      type: 'file_upload_progress',
-      fileId,
-      fileName,
-      progress: 0,
-      status: 'started',
-      canDownload: fileData.canDownload
-    });
-    
-  } else if (action === 'chunk') {
-    const fileData = fileMetadata.get(fileId);
-    if (!fileData) {
-      console.warn(`⚠️ File ${fileId} not found for chunk upload`);
-      return;
-    }
-    
-    fileData.chunkReceived++;
-    const progress = Math.round((fileData.chunkReceived / totalChunks) * 100);
-    
-    console.log(`📁 File ${fileName} upload progress: ${progress}% (${fileData.chunkReceived}/${totalChunks} chunks)`);
-    
-    // Store chunk only if we're keeping in memory (small files)
-    if (fileData.chunks) {
-      fileData.chunks[chunkIndex] = chunk;
-    }
-    
-    safeSend(ws, {
-      type: 'file_upload_progress',
-      fileId,
-      fileName,
-      progress,
-      status: 'uploading'
-    });
-    
-  } else if (action === 'end') {
-    const fileData = fileMetadata.get(fileId);
-    if (!fileData) {
-      console.warn(`⚠️ File ${fileId} not found for completion`);
-      return;
-    }
-    
-    fileData.status = 'completed';
-    fileData.completedAt = new Date().toISOString();
-    
-    console.log(`✅ File upload completed: ${fileName} (${fileSize} bytes)`);
-    
-    safeSend(ws, {
-      type: 'file_upload_complete',
-      fileId,
-      fileName,
-      fileSize,
-      fileType,
-      status: 'completed',
-      canDownload: fileData.canDownload
-    });
-    
-    // If we didn't store chunks (large file), we can't provide download via signaling
-    if (!fileData.canDownload) {
-      console.log(`⚠️ Large file ${fileName} not stored for download (server-side limitation)`);
-      safeSend(ws, {
-        type: 'warning',
-        message: 'Large file uploaded successfully but cannot be downloaded via signaling. Use direct transfer.',
-        fileId,
-        fileName
-      });
-    } else {
-      // Notify other clients in the room about the new file
-      roomData.clients.forEach(targetClient => {
-        if (targetClient.ws !== ws && targetClient.ws.readyState === WebSocket.OPEN) {
-          safeSend(targetClient.ws, {
-            type: 'file_available',
-            fileId,
-            fileName,
-            fileSize,
-            fileType,
-            uploaderId: clientId,
-            uploaderUserId: client.userId,
-            uploaderRole: client.role,
-            uploadedAt: fileData.uploadedAt,
-            canDownload: fileData.canDownload,
-            timestamp: Date.now()
-          });
-        }
-      });
-    }
-    
-    // Clean up metadata after a delay (only for large files that we don't store)
-    if (!fileData.canDownload) {
-      setTimeout(() => {
-        fileMetadata.delete(fileId);
-        console.log(`🧹 Cleared metadata for large file: ${fileName}`);
-      }, 5 * 60 * 1000); // 5 minutes
-    }
-  }
-}
-
-// File download handling
-function handleFileDownload(ws, message, clientId) {
-  const client = clients.get(ws);
-  if (!client || !client.room) {
-    console.warn(`⚠️ Client ${clientId} not in a room, cannot download file`);
-    safeSend(ws, { type: 'error', message: 'You must join a room first' });
-    return;
-  }
-
-  const { fileId, action, chunkIndex } = message;
-  const fileData = fileMetadata.get(fileId);
-  
-  if (!fileData) {
-    console.warn(`⚠️ File ${fileId} not found for download`);
-    safeSend(ws, { type: 'error', message: 'File not found' });
-    return;
-  }
-
-  if (!fileData.canDownload || !fileData.chunks) {
-    console.warn(`⚠️ File ${fileData.fileName} cannot be downloaded via signaling`);
-    safeSend(ws, { 
-      type: 'error', 
-      message: 'File too large for download via signaling. Use alternative transfer method.',
-      fileId,
-      fileName: fileData.fileName
-    });
-    return;
-  }
-
-  if (action === 'request') {
-    console.log(`📥 Client ${clientId} requesting file download: ${fileData.fileName}`);
-    
-    safeSend(ws, {
-      type: 'file_download_start',
-      fileId,
-      fileName: fileData.fileName,
-      fileSize: fileData.fileSize,
-      fileType: fileData.fileType,
-      totalChunks: fileData.totalChunks,
-      chunkSize: 16384 // 16KB chunks
-    });
-    
-  } else if (action === 'get_chunk') {
-    if (!fileData.chunks[chunkIndex]) {
-      console.warn(`⚠️ Chunk ${chunkIndex} not found for file ${fileId}`);
-      safeSend(ws, {
-        type: 'error',
-        message: `Chunk ${chunkIndex} not available`,
-        fileId,
-        chunkIndex
-      });
-      return;
-    }
-    
-    safeSend(ws, {
-      type: 'file_chunk',
-      fileId,
-      fileName: fileData.fileName,
-      chunk: fileData.chunks[chunkIndex],
-      chunkIndex,
-      totalChunks: fileData.totalChunks
-    });
-    
-    console.log(`📤 Sending chunk ${chunkIndex + 1}/${fileData.totalChunks} for file ${fileData.fileName}`);
-  }
-}
-
-// Resume download handler
-function handleResumeDownload(ws, message, clientId) {
-  const client = clients.get(ws);
-  if (!client || !client.room) {
-    console.warn(`⚠️ Client ${clientId} not in a room, cannot request resume`);
-    safeSend(ws, { type: 'error', message: 'You must join a room first' });
-    return;
-  }
-
-  const { resumeId } = message;
-  if (!resumeId) {
-    console.warn(`⚠️ Resume ID missing from download request`);
-    safeSend(ws, { type: 'error', message: 'Resume ID is required' });
-    return;
-  }
-
-  const roomData = rooms.get(client.room);
-  if (!roomData) {
-    console.warn(`⚠️ Room ${client.room} not found`);
-    return;
-  }
-
-  // Find the resume file in room files
-  const resumeFile = roomData.files.find(file => 
-    file.fileId === resumeId || 
-    file.fileName.toLowerCase().includes('resume') ||
-    (file.uploaderRole === 'participant' && file.fileType && (
-      file.fileType.includes('pdf') || 
-      file.fileType.includes('msword') || 
-      file.fileType.includes('wordprocessingml') ||
-      file.fileName.match(/\.(pdf|doc|docx|txt)$/i)
-    ))
-  );
-
-  if (!resumeFile) {
-    console.warn(`⚠️ Resume ${resumeId} not found`);
-    safeSend(ws, { 
-      type: 'resume_download_response',
-      success: false,
-      message: 'Resume not found in room files'
-    });
-    return;
-  }
-
-  console.log(`📄 Client ${clientId} requesting resume: ${resumeFile.fileName}`);
-
-  // Trigger file download with the found file ID
-  if (resumeFile.canDownload) {
-    handleFileDownload(ws, {
-      fileId: resumeFile.fileId,
-      action: 'request'
-    }, clientId);
-    
-    safeSend(ws, {
-      type: 'resume_download_response',
-      success: true,
-      fileId: resumeFile.fileId,
-      fileName: resumeFile.fileName,
-      fileSize: resumeFile.fileSize,
-      message: 'Resume download started'
-    });
-  } else {
-    safeSend(ws, {
-      type: 'resume_download_response',
-      success: false,
-      message: 'Resume is too large for download via signaling'
-    });
-  }
-}
-
-// Screen share state handling
 function handleScreenShareState(senderWs, message, senderId) {
   const client = clients.get(senderWs);
-  if (!client || !client.room) {
-    console.warn(`⚠️ Client ${senderId} not in a room`);
-    return;
-  }
+  if (!client || !client.room) return;
 
   const roomData = rooms.get(client.room);
-  if (!roomData) {
-    console.warn(`⚠️ Room ${client.room} not found`);
-    return;
-  }
+  if (!roomData) return;
 
   const isSharing = Boolean(message.isSharing);
-  console.log(`🖥️ Processing screen share state from ${client.role} ${senderId}: ${isSharing}`);
 
   const screenMessage = {
     type: 'screen_share_state',
@@ -820,29 +504,22 @@ function handleScreenShareState(senderWs, message, senderId) {
     fromSignaling: true
   };
 
-  let sentCount = 0;
   roomData.clients.forEach(targetClient => {
     if (targetClient.ws !== senderWs && targetClient.ws.readyState === WebSocket.OPEN) {
-      if (safeSend(targetClient.ws, screenMessage)) {
-        sentCount++;
-      }
+      safeSend(targetClient.ws, screenMessage);
     }
   });
-
-  console.log(`🖥️ Screen share state from ${client.role} ${senderId}: ${isSharing} (sent to ${sentCount} clients via signaling)`);
 }
 
-// Enhanced disconnect handling
 async function handleDisconnect(ws) {
   const client = clients.get(ws);
   if (!client || !client.room) {
-    console.log(`🔌 Unknown client disconnected`);
+    clients.delete(ws);
     return;
   }
 
   const roomData = rooms.get(client.room);
   if (!roomData) {
-    console.log(`🔌 Client ${client.role} ${client.id} disconnected from unknown room`);
     clients.delete(ws);
     return;
   }
@@ -850,7 +527,6 @@ async function handleDisconnect(ws) {
   console.log(`🔌 ${client.role} ${client.id} disconnected from room ${client.room}`);
 
   await withRoomLock(client.room, () => {
-    const wasInRoom = roomData.clients.some(c => c.ws === ws);
     roomData.clients = roomData.clients.filter(c => c.ws !== ws);
     
     if (client.role === 'interviewer') {
@@ -859,23 +535,20 @@ async function handleDisconnect(ws) {
       roomData.participants = roomData.participants.filter(p => p.ws !== ws);
     }
 
-    console.log(`👋 ${client.role} ${client.id} left room ${client.room} (${roomData.clients.length} remaining)`);
-
-    if (wasInRoom) {
-      roomData.clients.forEach(otherClient => {
-        if (otherClient.ws.readyState === WebSocket.OPEN) {
-          safeSend(otherClient.ws, {
-            type: 'peer_disconnected',
-            role: client.role,
-            senderId: client.id,
-            senderUserId: client.userId,
-            room: client.room,
-            timestamp: Date.now(),
-            reason: 'disconnected'
-          });
-        }
-      });
-    }
+    // Notify remaining clients
+    roomData.clients.forEach(otherClient => {
+      if (otherClient.ws.readyState === WebSocket.OPEN) {
+        safeSend(otherClient.ws, {
+          type: 'peer_disconnected',
+          role: client.role,
+          senderId: client.id,
+          senderUserId: client.userId,
+          room: client.room,
+          timestamp: Date.now(),
+          reason: 'disconnected'
+        });
+      }
+    });
 
     if (roomData.clients.length === 0) {
       rooms.delete(client.room);
@@ -888,7 +561,6 @@ async function handleDisconnect(ws) {
   });
 }
 
-// Helper function to leave room
 async function handleLeaveRoom(ws, roomId) {
   const roomData = rooms.get(roomId);
   if (!roomData) return;
@@ -909,13 +581,9 @@ async function handleLeaveRoom(ws, roomId) {
   });
 }
 
-// Enhanced room status logging
 function logRoomStatus(roomId) {
   const roomData = rooms.get(roomId);
-  if (!roomData) {
-    console.log(`❌ Room ${roomId} not found`);
-    return;
-  }
+  if (!roomData) return;
 
   const status = {
     room: roomId,
@@ -928,24 +596,18 @@ function logRoomStatus(roomId) {
     } : null,
     participants: roomData.participants
       .filter(p => p.ws.readyState === WebSocket.OPEN)
-      .map(p => ({
-        id: p.id,
-        userId: p.userId
-      })),
+      .map(p => ({ id: p.id, userId: p.userId })),
     messageHistoryCount: roomData.messages.length,
     fileCount: roomData.files.length,
-    downloadableFiles: roomData.files.filter(f => f.canDownload).length,
     createdAt: roomData.createdAt
   };
   
   console.log('📊 Room Status:', JSON.stringify(status, null, 2));
 }
 
-// Enhanced connection handler
 wss.on('connection', (ws, req) => {
   const clientId = ++clientIdCounter;
   const clientIp = req.socket.remoteAddress;
-  const connectionTime = new Date().toISOString();
   
   console.log(`✅ Client ${clientId} connected from ${clientIp}`);
   
@@ -957,20 +619,32 @@ wss.on('connection', (ws, req) => {
     userId: null,
     joinedAt: null,
     ip: clientIp,
-    connectedAt: connectionTime
+    connectedAt: new Date().toISOString()
   });
 
   setupHeartbeat(ws, clientId);
+
+  // Set connection timeout
+  const connectionTimeout = setTimeout(() => {
+    if (clients.get(ws) && !clients.get(ws).room) {
+      console.warn(`⚠️ Client ${clientId} did not join a room within timeout, closing`);
+      ws.close(1000, 'Connection timeout');
+    }
+  }, SERVER_CONFIG.CONNECTION_TIMEOUT);
+  
+  connectionTimeouts.set(ws, connectionTimeout);
 
   ws.on('message', (data) => {
     try {
       const message = JSON.parse(data);
       const client = clients.get(ws);
       
-      console.log(`📨 [Client ${clientId}${client?.room ? ` in room ${client.room}` : ''}] ${message.type}`);
+      console.log(`📨 [Client ${clientId}] ${message.type}`);
 
       switch (message.type) {
         case 'join':
+          clearTimeout(connectionTimeouts.get(ws));
+          connectionTimeouts.delete(ws);
           handleJoin(ws, message, clientId);
           break;
 
@@ -982,18 +656,6 @@ wss.on('connection', (ws, req) => {
 
         case 'chat':
           handleChatMessage(ws, message, clientId);
-          break;
-
-        case 'file_upload':
-          handleFileUpload(ws, message, clientId);
-          break;
-
-        case 'file_download':
-          handleFileDownload(ws, message, clientId);
-          break;
-
-        case 'resume_download_request':
-          handleResumeDownload(ws, message, clientId);
           break;
 
         case 'screen_share_state':
@@ -1024,7 +686,6 @@ wss.on('connection', (ws, req) => {
                   interviewer: !!roomData.interviewer,
                   participants: roomData.participants.length,
                   files: roomData.files.length,
-                  downloadableFiles: roomData.files.filter(f => f.canDownload).length,
                   createdAt: roomData.createdAt
                 },
                 timestamp: Date.now()
@@ -1049,33 +710,28 @@ wss.on('connection', (ws, req) => {
           break;
 
         default:
-          console.warn(`⚠️ Unknown message type: ${message.type} from client ${clientId}`);
-          safeSend(ws, { 
-            type: 'error', 
-            message: 'Unknown message type',
-            receivedType: message.type 
-          });
+          console.warn(`⚠️ Unknown message type: ${message.type}`);
       }
     } catch (error) {
       console.error('❌ Error parsing message:', error);
-      safeSend(ws, { 
-        type: 'error', 
-        message: 'Invalid message format',
-        details: error.message 
-      });
+      safeSend(ws, { type: 'error', message: 'Invalid message format' });
     }
   });
 
   ws.on('close', (code, reason) => {
+    clearTimeout(connectionTimeouts.get(ws));
+    connectionTimeouts.delete(ws);
     const client = clients.get(ws);
     if (client) {
-      console.log(`🔌 ${client.role || 'Unknown'} ${client.id} disconnected (code: ${code}, reason: ${reason || 'No reason'})`);
+      console.log(`🔌 Client ${client.id} disconnected (code: ${code})`);
       handleDisconnect(ws);
     }
   });
 
   ws.on('error', (error) => {
     console.error(`❌ WebSocket error for client ${clientId}:`, error);
+    clearTimeout(connectionTimeouts.get(ws));
+    connectionTimeouts.delete(ws);
     handleDisconnect(ws);
   });
 
@@ -1085,50 +741,23 @@ wss.on('connection', (ws, req) => {
     clientId: clientId,
     timestamp: Date.now(),
     serverInfo: {
-      version: '1.2.0',
+      version: '2.0.0',
       uptime: process.uptime(),
       totalRooms: rooms.size,
       totalClients: clients.size,
-      maxFileSize: `${SERVER_CONFIG.MAX_FILE_SIZE / (1024 * 1024)}MB`,
-      supportsFileTransfer: true,
-      maxInMemoryFileSize: `${SERVER_CONFIG.MAX_IN_MEMORY_FILE_SIZE / (1024 * 1024)}MB`
+      maxFileSize: `${SERVER_CONFIG.MAX_FILE_SIZE / (1024 * 1024)}MB`
     }
   });
 });
 
-// Periodic cleanup and stats logging
+// Periodic cleanup
 setInterval(() => {
-  const stats = {
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    totalRooms: rooms.size,
-    totalClients: clients.size,
-    connectedClients: Array.from(clients.values()).filter(c => c.ws.readyState === WebSocket.OPEN).length,
-    totalFiles: fileMetadata.size,
-    rooms: Array.from(rooms.entries()).map(([roomId, room]) => ({
-      roomId,
-      clientCount: room.clients.length,
-      connectedClientCount: room.clients.filter(c => c.ws.readyState === WebSocket.OPEN).length,
-      hasInterviewer: !!room.interviewer,
-      interviewerConnected: room.interviewer ? room.interviewer.ws.readyState === WebSocket.OPEN : false,
-      participantCount: room.participants.length,
-      fileCount: room.files.length,
-      downloadableFileCount: room.files.filter(f => f.canDownload).length,
-      createdAt: room.createdAt,
-      ageMinutes: Math.floor((Date.now() - new Date(room.createdAt).getTime()) / 60000)
-    }))
-  };
-  
-  console.log('📈 Server Statistics:', JSON.stringify(stats, null, 2));
-  
   let cleanedClients = 0;
   let cleanedRooms = 0;
-  let cleanedFiles = 0;
   
   // Clean dead clients
   clients.forEach((client, ws) => {
     if (ws.readyState !== WebSocket.OPEN) {
-      console.log(`🧹 Cleaning up dead connection: ${client.role || 'Unknown'} ${client.id}`);
       handleDisconnect(ws);
       cleanedClients++;
     }
@@ -1138,11 +767,8 @@ setInterval(() => {
   rooms.forEach((roomData, roomId) => {
     const activeClients = roomData.clients.filter(c => c.ws.readyState === WebSocket.OPEN);
     if (activeClients.length === 0) {
-      console.log(`🧹 Cleaning up empty room: ${roomId}`);
       rooms.delete(roomId);
       cleanedRooms++;
-      
-      // Also clean up room lock
       roomLocks.delete(roomId);
     } else {
       roomData.clients = activeClients;
@@ -1153,26 +779,8 @@ setInterval(() => {
     }
   });
   
-  // Clean up old files (older than retention period)
-  const retentionTime = Date.now() - (SERVER_CONFIG.FILE_RETENTION_MINUTES * 60 * 1000);
-  fileMetadata.forEach((fileData, fileId) => {
-    if (new Date(fileData.uploadedAt).getTime() < retentionTime) {
-      console.log(`🧹 Cleaning up old file: ${fileData.fileName}`);
-      fileMetadata.delete(fileId);
-      cleanedFiles++;
-    }
-  });
-  
-  // Clean up old room locks
-  const activeRoomIds = new Set(rooms.keys());
-  roomLocks.forEach((lock, roomId) => {
-    if (!activeRoomIds.has(roomId)) {
-      roomLocks.delete(roomId);
-    }
-  });
-  
-  if (cleanedClients > 0 || cleanedRooms > 0 || cleanedFiles > 0) {
-    console.log(`🧹 Cleaned up ${cleanedClients} dead clients, ${cleanedRooms} empty rooms, and ${cleanedFiles} old files`);
+  if (cleanedClients > 0 || cleanedRooms > 0) {
+    console.log(`🧹 Cleaned up ${cleanedClients} dead clients, ${cleanedRooms} empty rooms`);
   }
 }, SERVER_CONFIG.CLEANUP_INTERVAL);
 
@@ -1180,104 +788,33 @@ setInterval(() => {
 const gracefulShutdown = (signal) => {
   console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
   
-  // Send shutdown notice to all clients
-  const shutdownPromises = [];
   clients.forEach((client, ws) => {
     if (ws.readyState === WebSocket.OPEN) {
-      shutdownPromises.push(
-        new Promise((resolve) => {
-          try {
-            safeSend(ws, { 
-              type: 'server_shutdown', 
-              message: 'Server is shutting down',
-              timestamp: Date.now(),
-              signal: signal
-            });
-            
-            // Give clients time to process the message
-            setTimeout(() => {
-              try {
-                ws.close(1000, 'Server shutting down');
-                resolve();
-              } catch (error) {
-                console.error('Error closing client connection:', error);
-                resolve();
-              }
-            }, 500);
-          } catch (error) {
-            console.error('Error sending shutdown message:', error);
-            resolve();
-          }
-        })
-      );
+      try {
+        safeSend(ws, { type: 'server_shutdown', message: 'Server is shutting down', timestamp: Date.now() });
+        ws.close(1000, 'Server shutting down');
+      } catch (error) {
+        console.error('Error closing client connection:', error);
+      }
     }
   });
   
-  // Wait for all clients to be notified
-  Promise.all(shutdownPromises)
-    .then(() => {
-      console.log('🔒 All client connections closed');
-      
-      // Close the server
-      wss.close(() => {
-        console.log('✅ Signaling server shut down gracefully');
-        process.exit(0);
-      });
-      
-      // Force exit after 5 seconds if server doesn't close
-      setTimeout(() => {
-        console.warn('⚠️ Forcing exit after timeout');
-        process.exit(1);
-      }, 5000);
-    })
-    .catch(error => {
-      console.error('❌ Error during graceful shutdown:', error);
-      process.exit(1);
+  setTimeout(() => {
+    wss.close(() => {
+      console.log('✅ Signaling server shut down');
+      process.exit(0);
     });
+  }, 1000);
 };
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
-
-process.on('uncaughtException', (error) => {
-  console.error('💥 Uncaught Exception:', error);
-  console.error('Stack trace:', error.stack);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('💥 Unhandled Rejection at:', promise);
-  console.error('Reason:', reason);
-});
 
 console.log('\n✅ WebRTC Signaling Server ready!');
 console.log('='.repeat(50));
 console.log('📋 Server Information:');
 console.log(`   - Endpoint: ws://localhost:8082`);
 console.log(`   - Max file size: ${SERVER_CONFIG.MAX_FILE_SIZE / (1024 * 1024)}MB`);
-console.log(`   - Max in-memory file: ${SERVER_CONFIG.MAX_IN_MEMORY_FILE_SIZE / (1024 * 1024)}MB`);
 console.log(`   - Heartbeat: ${SERVER_CONFIG.HEARTBEAT_INTERVAL / 1000} seconds`);
-console.log(`   - Cleanup interval: ${SERVER_CONFIG.CLEANUP_INTERVAL / 1000} seconds`);
-console.log(`   - File retention: ${SERVER_CONFIG.FILE_RETENTION_MINUTES} minutes`);
-console.log('\n📋 Supported Message Types:');
-console.log('   - join: Join a room as interviewer/participant');
-console.log('   - offer/answer/ice-candidate: WebRTC signaling');
-console.log('   - chat: Text messages');
-console.log('   - file_upload: Upload files to room');
-console.log('   - file_download: Download files from room');
-console.log('   - resume_download_request: Request resume download');
-console.log('   - screen_share_state: Screen sharing status');
-console.log('   - ping/pong: Connection heartbeat');
-console.log('   - leave: Leave current room');
-console.log('   - room_status: Get room status');
-console.log('   - request_offer: Participant can request new offer');
-console.log('\n🔧 Features:');
-console.log('   - File upload/download support with size limits');
-console.log('   - Automatic reconnection handling');
-console.log('   - Message history for new joiners');
-console.log('   - Duplicate connection prevention');
-console.log('   - Connection monitoring with heartbeats');
-console.log('   - Graceful shutdown handling');
-console.log('   - Room locking for race condition prevention');
-console.log('   - Memory-efficient file handling');
+console.log(`   - Connection timeout: ${SERVER_CONFIG.CONNECTION_TIMEOUT / 1000} seconds`);
 console.log('='.repeat(50));

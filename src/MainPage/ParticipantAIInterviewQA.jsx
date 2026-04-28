@@ -16,6 +16,9 @@ function ParticipantAIInterviewQA({
   const [isTyping, setIsTyping] = useState(false);
   const [wordCount, setWordCount] = useState(0);
   const [charCount, setCharCount] = useState(0);
+  const [submitAttempts, setSubmitAttempts] = useState(0);
+  const [lastSubmitTime, setLastSubmitTime] = useState(0);
+  const [localResponding, setLocalResponding] = useState(false);
   
   // Calculate word and character counts
   useEffect(() => {
@@ -33,35 +36,116 @@ function ParticipantAIInterviewQA({
     }
   }, [answer]);
   
+  // Reset local responding when isResponding changes from true to false
+  useEffect(() => {
+    if (!isResponding && localResponding) {
+      setLocalResponding(false);
+    }
+  }, [isResponding, localResponding]);
+  
+  // Auto-clear answer after successful submit (optional - based on use case)
+  // This is commented out because typically you want to keep the answer visible
+  
   // Handle Enter key to submit (with Ctrl/Cmd)
   const handleKeyDown = (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !disabled && answer.trim()) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !disabled && answer.trim() && !isResponding && !localResponding) {
       e.preventDefault();
-      onSubmit();
+      e.stopPropagation();
+      handleSubmit();
     }
   };
   
-  // Get status indicator
+  // Handle submit with debouncing to prevent double submission
+  const handleSubmit = () => {
+    const now = Date.now();
+    
+    // Prevent double submission within 2 seconds
+    if (now - lastSubmitTime < 2000) {
+      console.log('⚠️ Submit throttled - too frequent');
+      return;
+    }
+    
+    if (disabled || aiInterviewerStatus !== 'listening' || answer.trim() === "" || isResponding || localResponding) {
+      console.log('Cannot submit:', { 
+        disabled, 
+        aiInterviewerStatus, 
+        hasAnswer: !!answer.trim(), 
+        isResponding,
+        localResponding 
+      });
+      return;
+    }
+    
+    console.log('📤 Submitting answer...');
+    setLastSubmitTime(now);
+    setSubmitAttempts(prev => prev + 1);
+    setLocalResponding(true);
+    
+    // Call the onSubmit prop
+    onSubmit();
+    
+    // Safety timeout to reset local responding if parent doesn't
+    setTimeout(() => {
+      setLocalResponding(false);
+    }, 10000);
+  };
+  
+  // Get status indicator with enhanced states
   const getStatusInfo = () => {
     switch(aiInterviewerStatus) {
       case 'speaking': 
-        return { color: '#9b59b6', icon: '📝', text: 'AI is preparing question...' };
+        return { color: '#9b59b6', icon: '📝', text: 'AI is preparing question...', isActive: true };
       case 'listening': 
-        return { color: '#27ae60', icon: '👂', text: 'Waiting for your response...' };
+        return { color: '#27ae60', icon: '👂', text: 'Waiting for your response...', isActive: true };
       case 'analyzing': 
-        return { color: '#f39c12', icon: '🔍', text: 'Analyzing your answer...' };
+        return { color: '#f39c12', icon: '🔍', text: 'Analyzing your answer...', isActive: true };
       case 'error': 
-        return { color: '#e74c3c', icon: '⚠️', text: 'AI encountered an error' };
+        return { color: '#e74c3c', icon: '⚠️', text: 'AI encountered an error', isActive: false };
       case 'generating': 
-        return { color: '#3498db', icon: '⚙️', text: 'Generating next question...' };
+        return { color: '#3498db', icon: '⚙️', text: 'Generating next question...', isActive: true };
       case 'resume_analyzing': 
-        return { color: '#8e44ad', icon: '📄', text: 'Analyzing resume for questions...' };
+        return { color: '#8e44ad', icon: '📄', text: 'Analyzing resume for questions...', isActive: true };
+      case 'connected':
+        return { color: '#2ecc71', icon: '🔌', text: 'AI Interviewer Connected', isActive: true };
+      case 'complete':
+        return { color: '#27ae60', icon: '✅', text: 'Interview Complete!', isActive: false };
+      case 'idle':
+        return { color: '#7f8c8d', icon: '🤖', text: 'AI Interviewer Ready', isActive: false };
+      case 'disconnected':
+        return { color: '#e74c3c', icon: '🔌', text: 'AI Disconnected - Reconnecting...', isActive: false };
       default: 
-        return { color: '#7f8c8d', icon: '🤖', text: 'AI Interviewer Ready' };
+        return { color: '#7f8c8d', icon: '🤖', text: 'AI Interviewer Ready', isActive: false };
     }
   };
 
   const statusInfo = getStatusInfo();
+  
+  // Determine if submit button should be disabled
+  const isSubmitDisabled = disabled || 
+    aiInterviewerStatus !== 'listening' || 
+    answer.trim() === "" || 
+    isResponding || 
+    localResponding;
+  
+  // Determine if textarea should be disabled
+  const isTextareaDisabled = aiInterviewerStatus !== 'listening' || disabled;
+  
+  // Get appropriate placeholder text
+  const getPlaceholderText = () => {
+    if (aiInterviewerStatus === 'listening') {
+      return "Type your answer here. Press Ctrl+Enter to submit.";
+    } else if (aiInterviewerStatus === 'speaking' || aiInterviewerStatus === 'generating') {
+      return "AI is preparing the next question...";
+    } else if (aiInterviewerStatus === 'analyzing') {
+      return "AI is analyzing your previous answer...";
+    } else if (aiInterviewerStatus === 'complete') {
+      return "Interview completed! Thank you for participating.";
+    } else if (aiInterviewerStatus === 'connected') {
+      return "AI Interviewer is ready. Waiting for first question...";
+    } else {
+      return "Type your answer here...";
+    }
+  };
 
   return (
     <div className="participant-ai-qa-container">
@@ -75,11 +159,14 @@ function ParticipantAIInterviewQA({
           </span>
         </div>
         <div 
-          className="participant-ai-status-indicator" 
+          className={`participant-ai-status-indicator ${statusInfo.isActive ? 'active' : ''}`}
           style={{ backgroundColor: statusInfo.color }}
         >
           <span className="participant-ai-status-icon">{statusInfo.icon}</span>
           <span className="participant-ai-status-text">{statusInfo.text}</span>
+          {statusInfo.isActive && (
+            <span className="participant-ai-status-pulse"></span>
+          )}
         </div>
       </div>
       
@@ -128,7 +215,7 @@ function ParticipantAIInterviewQA({
           )}
         </div>
         
-        {/* Progress Indicator */}
+        {/* Response Progress Indicator */}
         <div className="participant-response-progress">
           <div className="participant-progress-label">
             <span>Response Progress</span>
@@ -146,14 +233,16 @@ function ParticipantAIInterviewQA({
             ></div>
           </div>
           <div className="participant-progress-stats">
-            <span className={`participant-progress-stat ${wordCount < 50 ? 'warning' : ''}`}>
+            <span className={`participant-progress-stat ${wordCount < 30 ? 'warning' : wordCount >= 50 ? 'good' : ''}`}>
               <span className="participant-stat-icon">📝</span>
               {wordCount} {wordCount === 1 ? 'word' : 'words'}
-              {wordCount < 50 && ' (Try to write more)'}
+              {wordCount < 30 && ' (Aim for 50+ words)'}
+              {wordCount >= 50 && ' ✓ Great length!'}
             </span>
             <span className={`participant-progress-stat ${charCount > 500 ? 'warning' : ''}`}>
               <span className="participant-stat-icon">✍️</span>
               {charCount}/500 characters
+              {charCount > 500 && ' (Too long!)'}
             </span>
           </div>
         </div>
@@ -167,18 +256,12 @@ function ParticipantAIInterviewQA({
         </div>
         <div className="participant-response-container">
           <textarea
-            className="participant-response-textarea"
-            placeholder={
-              disabled ? (
-                aiInterviewerStatus === 'speaking' || aiInterviewerStatus === 'generating' ? 
-                "AI is preparing the next question..." : 
-                "Type your answer here..."
-              ) : "Type your answer here. Press Ctrl+Enter to submit."
-            }
+            className={`participant-response-textarea ${aiInterviewerStatus === 'listening' ? 'active' : ''}`}
+            placeholder={getPlaceholderText()}
             value={answer}
             onChange={(e) => setAnswer(e.target.value)}
             onKeyDown={handleKeyDown}
-            disabled={disabled || aiInterviewerStatus !== 'listening'}
+            disabled={isTextareaDisabled}
             rows="6"
             maxLength="2000"
           />
@@ -186,24 +269,19 @@ function ParticipantAIInterviewQA({
           {/* Character Counter & Controls */}
           <div className="participant-response-controls">
             <div className="participant-char-counter">
-              <span className={`participant-counter ${charCount > 500 ? 'warning' : ''}`}>
-                {charCount}/500 characters
+              <span className={`participant-counter ${charCount > 500 ? 'warning' : charCount > 300 ? 'info' : ''}`}>
+                📝 {charCount}/500 characters • {wordCount} words
               </span>
               {isTyping && <span className="participant-typing-indicator">✍️ Typing...</span>}
             </div>
             
             <div className="participant-submit-section">
               <button
-                className="participant-submit-button"
-                disabled={
-                  disabled || 
-                  aiInterviewerStatus !== 'listening' || 
-                  answer.trim() === "" ||
-                  isResponding
-                }
-                onClick={onSubmit}
+                className={`participant-submit-button ${isSubmitDisabled ? 'disabled' : 'active'}`}
+                disabled={isSubmitDisabled}
+                onClick={handleSubmit}
               >
-                {isResponding ? (
+                {(isResponding || localResponding) ? (
                   <>
                     <span className="participant-submit-spinner"></span>
                     Sending...
@@ -228,10 +306,11 @@ function ParticipantAIInterviewQA({
               Tips for a good answer:
             </div>
             <ul className="participant-tips-list">
-              <li>Be specific and provide examples</li>
-              <li>Aim for 50-100 words per answer</li>
-              <li>Structure your answer clearly</li>
-              <li>Relate answers to your resume experience</li>
+              <li>Be specific and provide real-world examples</li>
+              <li>Aim for 50-100 words per answer for better scores</li>
+              <li>Structure your answer clearly (Situation, Task, Action, Result)</li>
+              <li>Relate answers to your resume experience and skills</li>
+              <li>Use technical terms relevant to the question</li>
             </ul>
           </div>
         </div>
@@ -254,14 +333,33 @@ function ParticipantAIInterviewQA({
         <div className="participant-interview-stats">
           <span className="participant-interview-stat">
             <span className="participant-stat-icon">✅</span>
-            {currentQuestionNumber} questions answered
+            {currentQuestionNumber} of {totalQuestions} questions answered
+          </span>
+          <span className="participant-interview-stat">
+            <span className="participant-stat-icon">📊</span>
+            {Math.round((currentQuestionNumber / totalQuestions) * 100)}% Complete
           </span>
           <span className="participant-interview-stat">
             <span className="participant-stat-icon">⏱️</span>
-            Estimated: {Math.round((totalQuestions - currentQuestionNumber) * 2)} min remaining
+            Est. remaining: {Math.max(0, Math.round((totalQuestions - currentQuestionNumber) * 2))} min
           </span>
         </div>
       </div>
+      
+      {/* Feedback Section - Optional, can be shown when answer is submitted */}
+      {/* This can be uncommented if you want to show immediate feedback */}
+      {/*
+      {feedback && (
+        <div className={`participant-feedback ${feedback.score >= 7 ? 'positive' : feedback.score >= 4 ? 'neutral' : 'negative'}`}>
+          <div className="participant-feedback-score">
+            Score: {feedback.score}/10
+          </div>
+          <div className="participant-feedback-message">
+            {feedback.message}
+          </div>
+        </div>
+      )}
+      */}
     </div>
   );
 }

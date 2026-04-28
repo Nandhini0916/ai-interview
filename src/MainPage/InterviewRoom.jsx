@@ -135,8 +135,13 @@ function InterviewRoom({ room, onLeave }) {
     
     if (data.type === 'ping') {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'pong' }));
+        wsRef.current.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
       }
+      return;
+    }
+    
+    if (data.type === 'pong') {
+      console.log('📡 Received pong from server');
       return;
     }
     
@@ -688,95 +693,172 @@ function InterviewRoom({ room, onLeave }) {
     );
   };
 
-  const connectWebSocket = () => {
-    if (isExplicitlyClosing) return;
+  // Replace the connectWebSocket function in InterviewRoom.jsx with this improved version:
+
+const connectWebSocket = () => {
+  if (isExplicitlyClosing) return;
+  
+  try {
+    if (wsRef.current) {
+      if (wsRef.current.pingInterval) clearInterval(wsRef.current.pingInterval);
+      if (wsRef.current.pongTimeout) clearTimeout(wsRef.current.pongTimeout);
+      wsRef.current.close();
+      wsRef.current = null;
+    }
     
-    try {
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
+    console.log('🔌 Connecting to AI WebSocket at ws://localhost:8001/ws');
+    const ws = new WebSocket("ws://localhost:8001/ws");
+    let pingInterval = null;
+    let pongTimeout = null;
+    let connectionTimeout = setTimeout(() => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        console.error('❌ WebSocket connection timeout');
+        ws.close();
+        setAiConnected(false);
+      }
+    }, 5000);
+    
+    ws.onopen = () => {
+      clearTimeout(connectionTimeout);
+      console.log("✅ Connected to AI WebSocket");
+      setAiConnected(true);
+      setConnectionRetryCount(0);
+      
+      // Register the session immediately
+      if (currentSessionId) {
+        const registerMsg = {
+          type: 'command',
+          command: 'register_session',
+          session_id: currentSessionId,
+          room_id: room.id
+        };
+        console.log('📤 Registering session:', registerMsg);
+        ws.send(JSON.stringify(registerMsg));
       }
       
-      console.log('🔌 Connecting to AI WebSocket...');
-      const ws = new WebSocket("ws://localhost:8001/ws");
-      
-      ws.onopen = () => {
-        console.log("✅ Connected to AI WebSocket");
-        setAiConnected(true);
-        setConnectionRetryCount(0);
-        
-        if (currentSessionId) {
-          const registerMsg = {
-            type: 'command',
-            command: 'register_session',
-            session_id: currentSessionId,
-            room_id: room.id
-          };
-          console.log('📤 Registering session:', registerMsg);
-          ws.send(JSON.stringify(registerMsg));
+      // Start ping interval to keep connection alive
+      pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          console.log("📡 Sending ping to server");
+          ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+          
+          if (pongTimeout) clearTimeout(pongTimeout);
+          pongTimeout = setTimeout(() => {
+            console.warn("⚠️ No pong received from server, reconnecting...");
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.close();
+            }
+          }, 10000);
         }
+      }, 15000); // Send ping every 15 seconds
+      
+      setTimeout(() => {
+        if (participantVideoRef.current && interviewStatus === "active" && !isExplicitlyClosing) {
+          if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+          frameIntervalRef.current = setInterval(captureAndSendFrame, 1000);
+          console.log('🎥 Started frame capture interval');
+        }
+      }, 1000);
+    };
+    
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
         
-        setTimeout(() => {
-          if (participantVideoRef.current && interviewStatus === "active") {
-            if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
-            frameIntervalRef.current = setInterval(captureAndSendFrame, 1000);
-            console.log('🎥 Started frame capture interval');
+        if (data.type === 'ping') {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
           }
-        }, 1000);
-      };
-      
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          handleWebSocketMessage(data);
-        } catch (err) {
-          console.error("❌ Error parsing WebSocket message:", err);
-        }
-      };
-      
-      ws.onclose = (event) => {
-        console.log("🔌 AI WebSocket disconnected:", event.code, event.reason);
-        setAiConnected(false);
-        
-        if (frameIntervalRef.current) {
-          clearInterval(frameIntervalRef.current);
-          frameIntervalRef.current = null;
+          return;
         }
         
-        if (interviewStatus === "active" && !isExplicitlyClosing && connectionRetryCount < 3) {
-          const delay = Math.min(3000 * (connectionRetryCount + 1), 15000);
-          console.log(`🔄 Reconnecting WebSocket in ${delay}ms... (attempt ${connectionRetryCount + 1})`);
-          setConnectionRetryCount(prev => prev + 1);
-          setTimeout(() => connectWebSocket(), delay);
+        if (data.type === 'pong') {
+          if (pongTimeout) {
+            clearTimeout(pongTimeout);
+            pongTimeout = null;
+          }
+          console.log('📡 Received pong from server');
+          return;
         }
-      };
-      
-      ws.onerror = (error) => {
-        console.error("❌ AI WebSocket error:", error);
-        setAiConnected(false);
-      };
-      
-      wsRef.current = ws;
-      
-    } catch (err) {
-      console.error("❌ WebSocket connection failed:", err);
+        
+        if (data.type === 'connection_established') {
+          console.log('✅ WebSocket connection established with server');
+          setAiConnected(true);
+          return;
+        }
+        
+        handleWebSocketMessage(data);
+      } catch (err) {
+        console.error("❌ Error parsing WebSocket message:", err);
+      }
+    };
+    
+    ws.onclose = (event) => {
+      clearTimeout(connectionTimeout);
+      console.log("🔌 AI WebSocket disconnected:", event.code, event.reason);
+      if (pingInterval) clearInterval(pingInterval);
+      if (pongTimeout) clearTimeout(pongTimeout);
       setAiConnected(false);
-    }
-  };
+      
+      if (frameIntervalRef.current) {
+        clearInterval(frameIntervalRef.current);
+        frameIntervalRef.current = null;
+      }
+      
+      // Auto-reconnect logic
+      if (interviewStatus === "active" && !isExplicitlyClosing && connectionRetryCount < 5) {
+        const delay = Math.min(3000 * Math.pow(1.5, connectionRetryCount), 20000);
+        console.log(`🔄 Reconnecting WebSocket in ${delay}ms... (attempt ${connectionRetryCount + 1}/5)`);
+        setConnectionRetryCount(prev => prev + 1);
+        reconnectTimeoutRef.current = setTimeout(() => connectWebSocket(), delay);
+      }
+    };
+    
+    ws.onerror = (error) => {
+      clearTimeout(connectionTimeout);
+      console.error("❌ AI WebSocket error:", error);
+      setAiConnected(false);
+    };
+    
+    wsRef.current = ws;
+    wsRef.current.pingInterval = pingInterval;
+    wsRef.current.pongTimeout = pongTimeout;
+    
+  } catch (err) {
+    console.error("❌ WebSocket connection failed:", err);
+    setAiConnected(false);
+  }
+};
 
   const connectToAIInterviewer = () => {
     if (isExplicitlyClosing) return;
     
     try {
       if (aiWsRef.current) {
+        if (aiWsRef.current.pingInterval) clearInterval(aiWsRef.current.pingInterval);
+        if (aiWsRef.current.pongTimeout) clearTimeout(aiWsRef.current.pongTimeout);
         aiWsRef.current.close();
       }
       
       const ws = new WebSocket("ws://localhost:8001/ws");
+      let pingInterval = null;
+      let pongTimeout = null;
       
       ws.onopen = () => {
         console.log("✅ Connected to AI Interviewer WebSocket");
         setAiInterviewerStatus("connected");
+        
+        // Start ping interval
+        pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+            if (pongTimeout) clearTimeout(pongTimeout);
+            pongTimeout = setTimeout(() => {
+              console.warn("⚠️ No pong from AI server, reconnecting...");
+              if (ws.readyState === WebSocket.OPEN) ws.close();
+            }, 10000);
+          }
+        }, 20000);
         
         if (currentSessionId) {
           ws.send(JSON.stringify({
@@ -791,6 +873,18 @@ function InterviewRoom({ room, onLeave }) {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          
+          if (data.type === 'ping') {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+            }
+            return;
+          }
+          
+          if (data.type === 'pong') {
+            if (pongTimeout) clearTimeout(pongTimeout);
+            return;
+          }
           
           if (data.type === 'ai_interview_started') {
             console.log('🤖 AI interview started');
@@ -854,6 +948,8 @@ function InterviewRoom({ room, onLeave }) {
       
       ws.onclose = () => {
         console.log("🔌 AI Interviewer WebSocket disconnected");
+        if (pingInterval) clearInterval(pingInterval);
+        if (pongTimeout) clearTimeout(pongTimeout);
         setAiInterviewerStatus("disconnected");
       };
       
@@ -863,6 +959,8 @@ function InterviewRoom({ room, onLeave }) {
       };
       
       aiWsRef.current = ws;
+      aiWsRef.current.pingInterval = pingInterval;
+      aiWsRef.current.pongTimeout = pongTimeout;
     } catch (err) {
       console.error("❌ AI Interviewer WebSocket connection failed:", err);
       setAiInterviewerStatus("error");
@@ -1020,6 +1118,8 @@ function InterviewRoom({ room, onLeave }) {
     }
     
     if (aiWsRef.current) {
+      if (aiWsRef.current.pingInterval) clearInterval(aiWsRef.current.pingInterval);
+      if (aiWsRef.current.pongTimeout) clearTimeout(aiWsRef.current.pongTimeout);
       aiWsRef.current.close();
     }
     
@@ -1231,11 +1331,15 @@ function InterviewRoom({ room, onLeave }) {
     }
     
     if (wsRef.current) {
+      if (wsRef.current.pingInterval) clearInterval(wsRef.current.pingInterval);
+      if (wsRef.current.pongTimeout) clearTimeout(wsRef.current.pongTimeout);
       wsRef.current.close();
       setAiConnected(false);
     }
     
     if (aiWsRef.current) {
+      if (aiWsRef.current.pingInterval) clearInterval(aiWsRef.current.pingInterval);
+      if (aiWsRef.current.pongTimeout) clearTimeout(aiWsRef.current.pongTimeout);
       aiWsRef.current.close();
       setAiInterviewerStatus("disconnected");
     }

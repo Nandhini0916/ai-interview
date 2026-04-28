@@ -45,3 +45,7 @@ anyio==4.2.0
 pillow==10.1.0
 pytest==7.4.3
 pytest-asyncio==0.21.1
+
+openai-whisper==20231117  # For transcription
+ffmpeg-python==0.2.0      # For audio conversion
+speechrecognition==3.10.0  # Fallback STT
