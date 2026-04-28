@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import "./ParticipantAIInterviewQA.css";
 
 function ParticipantAIInterviewQA({
@@ -11,7 +11,10 @@ function ParticipantAIInterviewQA({
   isResponding = false,
   currentQuestionNumber = 0,
   totalQuestions = 10,
-  resumeUploaded = false
+  resumeUploaded = false,
+  voiceEnabled = true,
+  showVoiceInput = true,
+  onVoiceTranscript
 }) {
   const [isTyping, setIsTyping] = useState(false);
   const [wordCount, setWordCount] = useState(0);
@@ -19,12 +22,31 @@ function ParticipantAIInterviewQA({
   const [submitAttempts, setSubmitAttempts] = useState(0);
   const [lastSubmitTime, setLastSubmitTime] = useState(0);
   const [localResponding, setLocalResponding] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcriptionError, setTranscriptionError] = useState(null);
+  const [showTips, setShowTips] = useState(true);
+  
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const timerRef = useRef(null);
+  const textareaRef = useRef(null);
+  const streamRef = useRef(null);
   
   // Calculate word and character counts
   useEffect(() => {
-    const trimmedAnswer = answer.trim();
+    const trimmedAnswer = answer?.trim() || "";
     setCharCount(trimmedAnswer.length);
     setWordCount(trimmedAnswer ? trimmedAnswer.split(/\s+/).filter(word => word.length > 0).length : 0);
+  }, [answer]);
+  
+  // Auto-resize textarea
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 150) + 'px';
+    }
   }, [answer]);
   
   // Handle typing animation
@@ -43,12 +65,166 @@ function ParticipantAIInterviewQA({
     }
   }, [isResponding, localResponding]);
   
-  // Auto-clear answer after successful submit (optional - based on use case)
-  // This is commented out because typically you want to keep the answer visible
+  // Speak question when AI is in speaking mode
+  useEffect(() => {
+    if (voiceEnabled && question && aiInterviewerStatus === 'speaking') {
+      speakQuestion();
+    }
+  }, [question, aiInterviewerStatus, voiceEnabled]);
+  
+  // Cleanup recording on unmount
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, []);
+  
+  const speakQuestion = () => {
+    if (!voiceEnabled || !window.speechSynthesis) return;
+    
+    // Cancel any ongoing speech
+    window.speechSynthesis.cancel();
+    
+    const utterance = new SpeechSynthesisUtterance(question);
+    utterance.rate = 0.95;
+    utterance.pitch = 1.0;
+    utterance.volume = 1.0;
+    utterance.lang = 'en-US';
+    
+    // Try to get a good voice
+    const voices = window.speechSynthesis.getVoices();
+    const preferredVoice = voices.find(voice => 
+      voice.lang === 'en-US' && !voice.name.includes('Microsoft')
+    );
+    if (preferredVoice) {
+      utterance.voice = preferredVoice;
+    }
+    
+    utterance.onend = () => {
+      console.log('Question speaking completed');
+    };
+    
+    window.speechSynthesis.speak(utterance);
+  };
+  
+  // Start voice recording
+  const startRecording = async () => {
+    if (disabled || aiInterviewerStatus !== 'listening') {
+      alert("Please wait for the AI to finish speaking before recording.");
+      return;
+    }
+    
+    setTranscriptionError(null);
+    
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4'
+      });
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+      
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+      
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { 
+          type: mediaRecorder.mimeType || 'audio/webm' 
+        });
+        await transcribeAudio(audioBlob);
+        
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(track => track.stop());
+          streamRef.current = null;
+        }
+      };
+      
+      mediaRecorder.start(100);
+      setIsRecording(true);
+      setRecordingTime(0);
+      
+      // Start timer
+      timerRef.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1);
+      }, 1000);
+      
+    } catch (err) {
+      console.error('Error accessing microphone:', err);
+      alert('Could not access microphone. Please check permissions and try again.');
+    }
+  };
+  
+  // Stop recording
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    }
+  };
+  
+  // Transcribe audio to text
+  const transcribeAudio = async (blob) => {
+    setIsTranscribing(true);
+    
+    try {
+      const formData = new FormData();
+      formData.append('audio', blob, 'recording.webm');
+      
+      const response = await fetch('http://localhost:8001/voice/transcribe', {
+        method: 'POST',
+        body: formData
+      });
+      
+      const result = await response.json();
+      
+      if (result.success && result.text) {
+        const transcribedText = result.text;
+        
+        // Update answer field
+        if (answer && answer.trim()) {
+          setAnswer(answer + " " + transcribedText);
+        } else {
+          setAnswer(transcribedText);
+        }
+        
+        // Call the voice transcript callback if provided
+        if (onVoiceTranscript) {
+          onVoiceTranscript(transcribedText);
+        }
+        
+        // Auto-submit after short delay
+        setTimeout(() => {
+          if (transcribedText.trim() && aiInterviewerStatus === 'listening' && !localResponding && !isResponding) {
+            handleSubmit();
+          }
+        }, 1000);
+      } else {
+        setTranscriptionError(result.error || 'Failed to transcribe audio');
+      }
+    } catch (err) {
+      console.error('Transcription error:', err);
+      setTranscriptionError('Network error. Please type your answer.');
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
   
   // Handle Enter key to submit (with Ctrl/Cmd)
   const handleKeyDown = (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !disabled && answer.trim() && !isResponding && !localResponding) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !disabled && answer?.trim() && !isResponding && !localResponding) {
       e.preventDefault();
       e.stopPropagation();
       handleSubmit();
@@ -65,14 +241,19 @@ function ParticipantAIInterviewQA({
       return;
     }
     
-    if (disabled || aiInterviewerStatus !== 'listening' || answer.trim() === "" || isResponding || localResponding) {
+    if (disabled || aiInterviewerStatus !== 'listening' || !answer?.trim() || isResponding || localResponding) {
       console.log('Cannot submit:', { 
         disabled, 
         aiInterviewerStatus, 
-        hasAnswer: !!answer.trim(), 
+        hasAnswer: !!answer?.trim(), 
         isResponding,
         localResponding 
       });
+      if (aiInterviewerStatus !== 'listening') {
+        alert("Please wait for AI to finish speaking before submitting.");
+      } else if (!answer?.trim()) {
+        alert("Please enter or record your answer before submitting.");
+      }
       return;
     }
     
@@ -90,13 +271,20 @@ function ParticipantAIInterviewQA({
     }, 10000);
   };
   
+  // Format time for recording display
+  const formatTime = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+  
   // Get status indicator with enhanced states
   const getStatusInfo = () => {
     switch(aiInterviewerStatus) {
       case 'speaking': 
-        return { color: '#9b59b6', icon: '📝', text: 'AI is preparing question...', isActive: true };
+        return { color: '#9b59b6', icon: '📝', text: 'AI is speaking...', isActive: true };
       case 'listening': 
-        return { color: '#27ae60', icon: '👂', text: 'Waiting for your response...', isActive: true };
+        return { color: '#27ae60', icon: '👂', text: 'Listening for your response...', isActive: true };
       case 'analyzing': 
         return { color: '#f39c12', icon: '🔍', text: 'Analyzing your answer...', isActive: true };
       case 'error': 
@@ -123,7 +311,7 @@ function ParticipantAIInterviewQA({
   // Determine if submit button should be disabled
   const isSubmitDisabled = disabled || 
     aiInterviewerStatus !== 'listening' || 
-    answer.trim() === "" || 
+    !answer?.trim() || 
     isResponding || 
     localResponding;
   
@@ -135,7 +323,7 @@ function ParticipantAIInterviewQA({
     if (aiInterviewerStatus === 'listening') {
       return "Type your answer here. Press Ctrl+Enter to submit.";
     } else if (aiInterviewerStatus === 'speaking' || aiInterviewerStatus === 'generating') {
-      return "AI is preparing the next question...";
+      return "AI is speaking... Please wait for your turn.";
     } else if (aiInterviewerStatus === 'analyzing') {
       return "AI is analyzing your previous answer...";
     } else if (aiInterviewerStatus === 'complete') {
@@ -192,6 +380,9 @@ function ParticipantAIInterviewQA({
         <div className="participant-section-label">
           <span className="participant-label-icon">❓</span>
           AI Question
+          {voiceEnabled && aiInterviewerStatus === 'speaking' && (
+            <span className="speaking-badge">🔊 Speaking...</span>
+          )}
         </div>
         <div className="participant-ai-question-card">
           <div className="participant-ai-question-text">
@@ -253,16 +444,59 @@ function ParticipantAIInterviewQA({
         <div className="participant-section-label">
           <span className="participant-label-icon">💬</span>
           Your Response
+          {aiInterviewerStatus === 'listening' && (
+            <span className="listening-badge">🎤 Ready for your answer</span>
+          )}
         </div>
+        
+        {/* Voice Recording Section */}
+        {voiceEnabled && showVoiceInput && (
+          <div className="participant-voice-recorder">
+            {!isRecording ? (
+              <button
+                type="button"
+                onClick={startRecording}
+                disabled={disabled || aiInterviewerStatus !== 'listening' || isTranscribing}
+                className={`voice-record-button ${aiInterviewerStatus === 'listening' ? 'ready' : ''}`}
+              >
+                <span className="voice-icon">🎤</span>
+                {isTranscribing ? 'Transcribing...' : 'Record Voice Answer'}
+              </button>
+            ) : (
+              <div className="recording-controls">
+                <div className="recording-indicator">
+                  <span className="recording-dot"></span>
+                  <span className="recording-time">{formatTime(recordingTime)}</span>
+                </div>
+                <button onClick={stopRecording} className="stop-record-button">
+                  ⏹️ Stop Recording
+                </button>
+              </div>
+            )}
+            {transcriptionError && (
+              <div className="transcription-error">
+                ⚠️ {transcriptionError}
+              </div>
+            )}
+            {voiceEnabled && aiInterviewerStatus === 'listening' && !isRecording && !isTranscribing && (
+              <div className="voice-hint">
+                💡 Click the microphone to record your answer, or type below
+              </div>
+            )}
+          </div>
+        )}
+        
+        {/* Text Input Section */}
         <div className="participant-response-container">
           <textarea
+            ref={textareaRef}
             className={`participant-response-textarea ${aiInterviewerStatus === 'listening' ? 'active' : ''}`}
             placeholder={getPlaceholderText()}
-            value={answer}
+            value={answer || ""}
             onChange={(e) => setAnswer(e.target.value)}
             onKeyDown={handleKeyDown}
             disabled={isTextareaDisabled}
-            rows="6"
+            rows="5"
             maxLength="2000"
           />
           
@@ -277,7 +511,7 @@ function ParticipantAIInterviewQA({
             
             <div className="participant-submit-section">
               <button
-                className={`participant-submit-button ${isSubmitDisabled ? 'disabled' : 'active'}`}
+                className={`participant-submit-button ${!isSubmitDisabled ? 'active' : ''}`}
                 disabled={isSubmitDisabled}
                 onClick={handleSubmit}
               >
@@ -299,19 +533,25 @@ function ParticipantAIInterviewQA({
             </div>
           </div>
           
-          {/* Response Tips */}
+          {/* Response Tips - Collapsible */}
           <div className="participant-response-tips">
-            <div className="participant-tips-title">
+            <div 
+              className="participant-tips-header"
+              onClick={() => setShowTips(!showTips)}
+            >
               <span className="participant-tips-icon">💡</span>
-              Tips for a good answer:
+              <span>Tips for a good answer</span>
+              <span className="participant-tips-toggle">{showTips ? '▼' : '▲'}</span>
             </div>
-            <ul className="participant-tips-list">
-              <li>Be specific and provide real-world examples</li>
-              <li>Aim for 50-100 words per answer for better scores</li>
-              <li>Structure your answer clearly (Situation, Task, Action, Result)</li>
-              <li>Relate answers to your resume experience and skills</li>
-              <li>Use technical terms relevant to the question</li>
-            </ul>
+            {showTips && (
+              <ul className="participant-tips-list">
+                <li>Be specific and provide real-world examples</li>
+                <li>Aim for 50-100 words per answer for better scores</li>
+                <li>Structure your answer clearly (Situation, Task, Action, Result)</li>
+                <li>Relate answers to your resume experience and skills</li>
+                <li>Use technical terms relevant to the question</li>
+              </ul>
+            )}
           </div>
         </div>
       </div>
@@ -345,21 +585,6 @@ function ParticipantAIInterviewQA({
           </span>
         </div>
       </div>
-      
-      {/* Feedback Section - Optional, can be shown when answer is submitted */}
-      {/* This can be uncommented if you want to show immediate feedback */}
-      {/*
-      {feedback && (
-        <div className={`participant-feedback ${feedback.score >= 7 ? 'positive' : feedback.score >= 4 ? 'neutral' : 'negative'}`}>
-          <div className="participant-feedback-score">
-            Score: {feedback.score}/10
-          </div>
-          <div className="participant-feedback-message">
-            {feedback.message}
-          </div>
-        </div>
-      )}
-      */}
     </div>
   );
 }
