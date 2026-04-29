@@ -2,12 +2,12 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 
-// Server Configuration
+// Server Configuration - UPDATED with better heartbeat intervals
 const SERVER_CONFIG = {
   MAX_FILE_SIZE: 50 * 1024 * 1024,
   MAX_IN_MEMORY_FILE_SIZE: 5 * 1024 * 1024,
-  HEARTBEAT_INTERVAL: 45000, // Increased to 45 seconds
-  HEARTBEAT_TIMEOUT: 15000, // 15 seconds
+  HEARTBEAT_INTERVAL: 25000, // REDUCED from 45000 to 25 seconds for better responsiveness
+  HEARTBEAT_TIMEOUT: 10000, // REDUCED from 15000 to 10 seconds
   CLEANUP_INTERVAL: 60000, // 60 seconds
   MAX_ROOMS: 100,
   MAX_CLIENTS_PER_ROOM: 50,
@@ -119,6 +119,7 @@ function setupHeartbeat(ws, clientId) {
   let isAlive = true;
   let pingInterval = null;
   let pongTimeout = null;
+  let consecutiveMissedPongs = 0;
 
   const clearTimers = () => {
     if (pingInterval) clearInterval(pingInterval);
@@ -131,14 +132,21 @@ function setupHeartbeat(ws, clientId) {
     // Send ping
     try {
       ws.ping(() => {});
-      ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+      ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now(), id: Date.now() }));
     } catch (err) {
       console.warn(`⚠️ Failed to send ping to client ${clientId}:`, err.message);
+      consecutiveMissedPongs++;
+      if (consecutiveMissedPongs >= 3) {
+        console.warn(`⚠️ Client ${clientId} has missed ${consecutiveMissedPongs} pings, terminating`);
+        ws.terminate();
+        return;
+      }
     }
     
     pongTimeout = setTimeout(() => {
       if (!isAlive) {
-        console.warn(`⚠️ Client ${clientId} did not respond to ping, terminating`);
+        consecutiveMissedPongs++;
+        console.warn(`⚠️ Client ${clientId} did not respond to ping (${consecutiveMissedPongs}/3), terminating`);
         ws.terminate();
       } else {
         isAlive = false;
@@ -149,6 +157,7 @@ function setupHeartbeat(ws, clientId) {
 
   ws.on('pong', () => {
     isAlive = true;
+    consecutiveMissedPongs = 0;
     if (pongTimeout) clearTimeout(pongTimeout);
   });
 
@@ -157,6 +166,7 @@ function setupHeartbeat(ws, clientId) {
       const message = JSON.parse(data);
       if (message.type === 'pong') {
         isAlive = true;
+        consecutiveMissedPongs = 0;
         if (pongTimeout) clearTimeout(pongTimeout);
       }
     } catch (err) {
@@ -177,7 +187,7 @@ function setupHeartbeat(ws, clientId) {
     if (ws.readyState === WebSocket.OPEN) {
       schedulePing();
     }
-  }, 5000);
+  }, 3000);
 }
 
 async function handleJoin(ws, message, clientId) {
@@ -663,7 +673,7 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'ping':
-          safeSend(ws, { type: 'pong', timestamp: Date.now() });
+          safeSend(ws, { type: 'pong', timestamp: Date.now(), id: message.id || Date.now() });
           break;
 
         case 'leave':
@@ -741,7 +751,7 @@ wss.on('connection', (ws, req) => {
     clientId: clientId,
     timestamp: Date.now(),
     serverInfo: {
-      version: '2.0.0',
+      version: '2.0.1',
       uptime: process.uptime(),
       totalRooms: rooms.size,
       totalClients: clients.size,
@@ -815,6 +825,7 @@ console.log('='.repeat(50));
 console.log('📋 Server Information:');
 console.log(`   - Endpoint: ws://localhost:8082`);
 console.log(`   - Max file size: ${SERVER_CONFIG.MAX_FILE_SIZE / (1024 * 1024)}MB`);
-console.log(`   - Heartbeat: ${SERVER_CONFIG.HEARTBEAT_INTERVAL / 1000} seconds`);
+console.log(`   - Heartbeat interval: ${SERVER_CONFIG.HEARTBEAT_INTERVAL / 1000} seconds`);
+console.log(`   - Heartbeat timeout: ${SERVER_CONFIG.HEARTBEAT_TIMEOUT / 1000} seconds`);
 console.log(`   - Connection timeout: ${SERVER_CONFIG.CONNECTION_TIMEOUT / 1000} seconds`);
 console.log('='.repeat(50));

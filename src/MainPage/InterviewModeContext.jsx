@@ -6,15 +6,15 @@ const InterviewModeContext = createContext(null);
 export function InterviewModeProvider({ children }) {
   const [interviewerMode, setInterviewerMode] = useState("manual");
   const [participantMode, setParticipantMode] = useState("manual");
-  const [syncStatus, setSyncStatus] = useState("manual"); // "manual", "synced", "pending"
+  const [syncStatus, setSyncStatus] = useState("manual"); // "manual", "synced", "requested", "pending"
   
   // Function to update mode with synchronization
-  const updateInterviewerMode = (mode) => {
+  const updateInterviewerMode = (mode, shouldSync = false) => {
     setInterviewerMode(mode);
     
-    // Automatically sync with participant if we're connected
-    if (syncStatus === "synced") {
-      // Send sync command via WebRTC (will be handled in the component)
+    if (shouldSync) {
+      setSyncStatus("requested");
+      // The actual sync will be confirmed by WebRTC
     }
   };
   
@@ -27,6 +27,13 @@ export function InterviewModeProvider({ children }) {
     setInterviewerMode(mode);
     setParticipantMode(mode);
     setSyncStatus("synced");
+    console.log(`🔄 Modes synced to: ${mode}`);
+  };
+  
+  // FIX: Add the missing breakSync function
+  const breakSync = () => {
+    setSyncStatus("manual");
+    console.log("🔗 Mode sync broken - independent modes");
   };
   
   // Reset sync status
@@ -40,8 +47,10 @@ export function InterviewModeProvider({ children }) {
     setMode: updateInterviewerMode,
     isManual: interviewerMode === "manual",
     isAI: interviewerMode === "ai",
-    syncModes, // Function to sync with participant
-    resetSync, // Function to reset sync
+    syncMates: syncModes,  // Keep for compatibility
+    syncModes: syncModes,
+    resetSync: resetSync,
+    breakSync: breakSync,   // ADD THIS - Critical fix
     syncStatus
   }), [interviewerMode, syncStatus]);
 
@@ -51,13 +60,17 @@ export function InterviewModeProvider({ children }) {
     setMode: updateParticipantMode,
     isManual: participantMode === "manual",
     isAI: participantMode === "ai",
-    syncStatus
+    syncStatus,
+    breakSync: breakSync,   // Also expose breakSync for participant
+    syncModes: syncModes
   }), [participantMode, syncStatus]);
 
   return (
     <InterviewModeContext.Provider value={{
       interviewer: interviewerValue,
-      participant: participantValue
+      participant: participantValue,
+      breakSync: breakSync,  // Also expose at root level
+      syncStatus
     }}>
       {children}
     </InterviewModeContext.Provider>

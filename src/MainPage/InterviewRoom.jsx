@@ -3,7 +3,6 @@ import "./InterviewRoom.css";
 import { createDefaultWebRTCManager } from "../utils/webrtc";
 import ReportModal from "./ReportModal";
 import AIInterviewerPanel from "./AIInterviewerPanel";
-import AIInterviewQA from "./AIInterviewQA";
 import { useInterviewerMode } from "./InterviewModeContext";
 
 function InterviewRoom({ room, onLeave }) {
@@ -66,7 +65,7 @@ function InterviewRoom({ room, onLeave }) {
   const [connectionRetryCount, setConnectionRetryCount] = useState(0);
   const [isExplicitlyClosing, setIsExplicitlyClosing] = useState(false);
 
-  // ✅ USE INTERVIEWER MODE FROM CONTEXT
+  // ✅ USE INTERVIEWER MODE FROM CONTEXT - FIXED
   const { 
     mode: interviewMode, 
     setMode: setInterviewMode, 
@@ -87,6 +86,8 @@ function InterviewRoom({ room, onLeave }) {
   const modeSyncTimeoutRef = useRef(null);
   const connectionMonitorRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
+  const reconnectAttemptsRef = useRef(0);
+  const maxReconnectAttempts = 5;
 
   const PYTHON_API_URL = 'http://localhost:8001';
   const NODE_API_URL = 'http://localhost:8000/api';
@@ -98,6 +99,7 @@ function InterviewRoom({ room, onLeave }) {
     
     if (status === 'connected') {
       setConnectionRetryCount(0);
+      reconnectAttemptsRef.current = 0;
     }
   };
 
@@ -311,7 +313,7 @@ function InterviewRoom({ room, onLeave }) {
           
         } else if (data.syncResponse === "rejected") {
           console.log('❌ Participant rejected mode sync');
-          breakSync();
+          if (breakSync) breakSync();
           
           addMessage(
             `⚠️ Participant rejected mode sync. Modes are now independent.`, 
@@ -693,142 +695,142 @@ function InterviewRoom({ room, onLeave }) {
     );
   };
 
-  // Replace the connectWebSocket function in InterviewRoom.jsx with this improved version:
-
-const connectWebSocket = () => {
-  if (isExplicitlyClosing) return;
-  
-  try {
-    if (wsRef.current) {
-      if (wsRef.current.pingInterval) clearInterval(wsRef.current.pingInterval);
-      if (wsRef.current.pongTimeout) clearTimeout(wsRef.current.pongTimeout);
-      wsRef.current.close();
-      wsRef.current = null;
-    }
+  // Improved connectWebSocket function with better keep-alive
+  const connectWebSocket = () => {
+    if (isExplicitlyClosing) return;
     
-    console.log('🔌 Connecting to AI WebSocket at ws://localhost:8001/ws');
-    const ws = new WebSocket("ws://localhost:8001/ws");
-    let pingInterval = null;
-    let pongTimeout = null;
-    let connectionTimeout = setTimeout(() => {
-      if (ws.readyState !== WebSocket.OPEN) {
-        console.error('❌ WebSocket connection timeout');
-        ws.close();
-        setAiConnected(false);
-      }
-    }, 5000);
-    
-    ws.onopen = () => {
-      clearTimeout(connectionTimeout);
-      console.log("✅ Connected to AI WebSocket");
-      setAiConnected(true);
-      setConnectionRetryCount(0);
-      
-      // Register the session immediately
-      if (currentSessionId) {
-        const registerMsg = {
-          type: 'command',
-          command: 'register_session',
-          session_id: currentSessionId,
-          room_id: room.id
-        };
-        console.log('📤 Registering session:', registerMsg);
-        ws.send(JSON.stringify(registerMsg));
+    try {
+      if (wsRef.current) {
+        if (wsRef.current.pingInterval) clearInterval(wsRef.current.pingInterval);
+        if (wsRef.current.pongTimeout) clearTimeout(wsRef.current.pongTimeout);
+        wsRef.current.close();
+        wsRef.current = null;
       }
       
-      // Start ping interval to keep connection alive
-      pingInterval = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          console.log("📡 Sending ping to server");
-          ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
-          
-          if (pongTimeout) clearTimeout(pongTimeout);
-          pongTimeout = setTimeout(() => {
-            console.warn("⚠️ No pong received from server, reconnecting...");
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.close();
-            }
-          }, 10000);
+      console.log('🔌 Connecting to AI WebSocket at ws://localhost:8001/ws');
+      const ws = new WebSocket("ws://localhost:8001/ws");
+      let pingInterval = null;
+      let pongTimeout = null;
+      let connectionTimeout = setTimeout(() => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          console.error('❌ WebSocket connection timeout');
+          ws.close();
+          setAiConnected(false);
         }
-      }, 15000); // Send ping every 15 seconds
+      }, 10000);
       
-      setTimeout(() => {
-        if (participantVideoRef.current && interviewStatus === "active" && !isExplicitlyClosing) {
-          if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
-          frameIntervalRef.current = setInterval(captureAndSendFrame, 1000);
-          console.log('🎥 Started frame capture interval');
-        }
-      }, 1000);
-    };
-    
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
+      ws.onopen = () => {
+        clearTimeout(connectionTimeout);
+        console.log("✅ Connected to AI WebSocket");
+        setAiConnected(true);
+        setConnectionRetryCount(0);
+        reconnectAttemptsRef.current = 0;
         
-        if (data.type === 'ping') {
+        // Register the session immediately
+        if (currentSessionId) {
+          const registerMsg = {
+            type: 'command',
+            command: 'register_session',
+            session_id: currentSessionId,
+            room_id: room.id
+          };
+          console.log('📤 Registering session:', registerMsg);
+          ws.send(JSON.stringify(registerMsg));
+        }
+        
+        // Start ping interval to keep connection alive
+        pingInterval = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+            console.log("📡 Sending ping to server");
+            ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+            
+            if (pongTimeout) clearTimeout(pongTimeout);
+            pongTimeout = setTimeout(() => {
+              console.warn("⚠️ No pong received from server, reconnecting...");
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.close();
+              }
+            }, 10000);
           }
-          return;
-        }
+        }, 25000); // Send ping every 25 seconds
         
-        if (data.type === 'pong') {
-          if (pongTimeout) {
-            clearTimeout(pongTimeout);
-            pongTimeout = null;
+        setTimeout(() => {
+          if (participantVideoRef.current && interviewStatus === "active" && !isExplicitlyClosing) {
+            if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+            frameIntervalRef.current = setInterval(captureAndSendFrame, 1000);
+            console.log('🎥 Started frame capture interval');
           }
-          console.log('📡 Received pong from server');
-          return;
+        }, 1000);
+      };
+      
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          
+          if (data.type === 'ping') {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+            }
+            return;
+          }
+          
+          if (data.type === 'pong') {
+            if (pongTimeout) {
+              clearTimeout(pongTimeout);
+              pongTimeout = null;
+            }
+            console.log('📡 Received pong from server');
+            return;
+          }
+          
+          if (data.type === 'connection_established') {
+            console.log('✅ WebSocket connection established with server');
+            setAiConnected(true);
+            return;
+          }
+          
+          handleWebSocketMessage(data);
+        } catch (err) {
+          console.error("❌ Error parsing WebSocket message:", err);
+        }
+      };
+      
+      ws.onclose = (event) => {
+        clearTimeout(connectionTimeout);
+        console.log("🔌 AI WebSocket disconnected:", event.code, event.reason);
+        if (pingInterval) clearInterval(pingInterval);
+        if (pongTimeout) clearTimeout(pongTimeout);
+        setAiConnected(false);
+        
+        if (frameIntervalRef.current) {
+          clearInterval(frameIntervalRef.current);
+          frameIntervalRef.current = null;
         }
         
-        if (data.type === 'connection_established') {
-          console.log('✅ WebSocket connection established with server');
-          setAiConnected(true);
-          return;
+        // Auto-reconnect logic
+        if (interviewStatus === "active" && !isExplicitlyClosing && reconnectAttemptsRef.current < maxReconnectAttempts) {
+          const delay = Math.min(3000 * Math.pow(1.5, reconnectAttemptsRef.current), 20000);
+          console.log(`🔄 Reconnecting WebSocket in ${delay}ms... (attempt ${reconnectAttemptsRef.current + 1}/${maxReconnectAttempts})`);
+          reconnectAttemptsRef.current++;
+          reconnectTimeoutRef.current = setTimeout(() => connectWebSocket(), delay);
         }
-        
-        handleWebSocketMessage(data);
-      } catch (err) {
-        console.error("❌ Error parsing WebSocket message:", err);
-      }
-    };
-    
-    ws.onclose = (event) => {
-      clearTimeout(connectionTimeout);
-      console.log("🔌 AI WebSocket disconnected:", event.code, event.reason);
-      if (pingInterval) clearInterval(pingInterval);
-      if (pongTimeout) clearTimeout(pongTimeout);
-      setAiConnected(false);
+      };
       
-      if (frameIntervalRef.current) {
-        clearInterval(frameIntervalRef.current);
-        frameIntervalRef.current = null;
-      }
+      ws.onerror = (error) => {
+        clearTimeout(connectionTimeout);
+        console.error("❌ AI WebSocket error:", error);
+        setAiConnected(false);
+      };
       
-      // Auto-reconnect logic
-      if (interviewStatus === "active" && !isExplicitlyClosing && connectionRetryCount < 5) {
-        const delay = Math.min(3000 * Math.pow(1.5, connectionRetryCount), 20000);
-        console.log(`🔄 Reconnecting WebSocket in ${delay}ms... (attempt ${connectionRetryCount + 1}/5)`);
-        setConnectionRetryCount(prev => prev + 1);
-        reconnectTimeoutRef.current = setTimeout(() => connectWebSocket(), delay);
-      }
-    };
-    
-    ws.onerror = (error) => {
-      clearTimeout(connectionTimeout);
-      console.error("❌ AI WebSocket error:", error);
+      wsRef.current = ws;
+      wsRef.current.pingInterval = pingInterval;
+      wsRef.current.pongTimeout = pongTimeout;
+      
+    } catch (err) {
+      console.error("❌ WebSocket connection failed:", err);
       setAiConnected(false);
-    };
-    
-    wsRef.current = ws;
-    wsRef.current.pingInterval = pingInterval;
-    wsRef.current.pongTimeout = pongTimeout;
-    
-  } catch (err) {
-    console.error("❌ WebSocket connection failed:", err);
-    setAiConnected(false);
-  }
-};
+    }
+  };
 
   const connectToAIInterviewer = () => {
     if (isExplicitlyClosing) return;
@@ -858,7 +860,7 @@ const connectWebSocket = () => {
               if (ws.readyState === WebSocket.OPEN) ws.close();
             }, 10000);
           }
-        }, 20000);
+        }, 25000);
         
         if (currentSessionId) {
           ws.send(JSON.stringify({
@@ -895,6 +897,26 @@ const connectWebSocket = () => {
               setQuestionHistory([data.questions[0]]);
               addMessage(data.questions[0], 'ai_interviewer', new Date().toISOString());
               
+              // Play TTS for the question
+              if (aiInterviewerConfig.enableVoiceQuestions && 'speechSynthesis' in window) {
+                const utterance = new SpeechSynthesisUtterance(data.questions[0]);
+                utterance.rate = 0.95;
+                utterance.pitch = 1.0;
+                utterance.volume = 1.0;
+                utterance.lang = 'en-US';
+                
+                utterance.onstart = () => {
+                  setAiInterviewerStatus("speaking");
+                };
+                
+                utterance.onend = () => {
+                  setAiInterviewerStatus("listening");
+                  addMessage("👂 Waiting for participant response...", 'system', new Date().toISOString());
+                };
+                
+                window.speechSynthesis.speak(utterance);
+              }
+              
               if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
                 console.log('📤 Sending first question to participant via WebRTC');
                 webrtcManagerRef.current.sendData('chat', {
@@ -917,6 +939,26 @@ const connectWebSocket = () => {
               setCurrentQuestion(data.next_question);
               setQuestionHistory(prev => [...prev, data.next_question]);
               addMessage(data.next_question, 'ai_interviewer', new Date().toISOString());
+              
+              // Play TTS for next question
+              if (aiInterviewerConfig.enableVoiceQuestions && 'speechSynthesis' in window) {
+                const utterance = new SpeechSynthesisUtterance(data.next_question);
+                utterance.rate = 0.95;
+                utterance.pitch = 1.0;
+                utterance.volume = 1.0;
+                utterance.lang = 'en-US';
+                
+                utterance.onstart = () => {
+                  setAiInterviewerStatus("speaking");
+                };
+                
+                utterance.onend = () => {
+                  setAiInterviewerStatus("listening");
+                  addMessage("👂 Waiting for participant response...", 'system', new Date().toISOString());
+                };
+                
+                window.speechSynthesis.speak(utterance);
+              }
               
               if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
                 console.log('📤 Sending next question to participant via WebRTC');
@@ -1028,7 +1070,7 @@ const connectWebSocket = () => {
       const result = await response.json();
       console.log('✅ AI Interview started:', result);
       
-      await connectToAIInterviewer();
+      connectToAIInterviewer();
       
       if (result.questions && result.questions.length > 0) {
         const firstQuestion = result.questions[0];
@@ -1037,6 +1079,30 @@ const connectWebSocket = () => {
         setCurrentQuestion(firstQuestion);
         setQuestionHistory([firstQuestion]);
         addMessage(firstQuestion, 'ai_interviewer', new Date().toISOString());
+        
+        // Play TTS for first question
+        if (aiInterviewerConfig.enableVoiceQuestions && 'speechSynthesis' in window) {
+          const utterance = new SpeechSynthesisUtterance(firstQuestion);
+          utterance.rate = 0.95;
+          utterance.pitch = 1.0;
+          utterance.volume = 1.0;
+          utterance.lang = 'en-US';
+          
+          utterance.onstart = () => {
+            setAiInterviewerStatus("speaking");
+          };
+          
+          utterance.onend = () => {
+            setAiInterviewerStatus("listening");
+            addMessage("👂 Waiting for participant response...", 'system', new Date().toISOString());
+          };
+          
+          window.speechSynthesis.speak(utterance);
+        } else {
+          setTimeout(() => {
+            setAiInterviewerStatus("listening");
+          }, 3000);
+        }
         
         if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
           console.log('📤 Sending AI question to participant via WebRTC');
@@ -1061,14 +1127,8 @@ const connectWebSocket = () => {
       }
       
       addMessage("🤖 AI Interview started based on participant's resume!", 'system', new Date().toISOString());
-      setAiInterviewerStatus("speaking");
       
       alert("✅ AI interview started! Participant will now receive AI questions.");
-      
-      setTimeout(() => {
-        setAiInterviewerStatus("listening");
-        addMessage("👂 Waiting for participant response...", 'system', new Date().toISOString());
-      }, 3000);
       
     } catch (error) {
       console.error('❌ Error starting AI interview:', error);
@@ -1194,7 +1254,7 @@ const connectWebSocket = () => {
             'system', 
             new Date().toISOString()
           );
-          breakSync();
+          if (breakSync) breakSync();
         }
       }, 10000);
       
@@ -1383,6 +1443,7 @@ const connectWebSocket = () => {
     setAiInterviewerStatus("idle");
     setResumeData(null);
     setConnectionRetryCount(0);
+    reconnectAttemptsRef.current = 0;
     setIsExplicitlyClosing(false);
     
     console.log('✅ Interviewer camera stopped');
@@ -2269,15 +2330,63 @@ const connectWebSocket = () => {
           <div className="video-container">
             <div className={`video-grid ${isScreenSharing || isParticipantScreenSharing ? 'has-screen-share' : ''}`}>
               
+              {/* INTERVIEWER VIDEO TILE - FIXED: Removed AIInterviewQA component */}
               <div className={`video-tile interviewer-tile ${isScreenSharing ? 'screen-share' : ''} ${interviewMode === 'ai' && aiInterviewerActive ? 'ai-agent-active' : ''}`}>
                 {interviewMode === 'ai' && aiInterviewerActive ? (
-                  <AIInterviewQA
-                    currentQuestion={currentQuestion}
-                    candidateResponse={candidateResponse}
-                    setCandidateResponse={setCandidateResponse}
-                    aiInterviewerStatus={aiInterviewerStatus}
-                    onSubmitAnswer={() => {}}
-                  />
+                  // INTERVIEWER VIEW - Shows AI status panel (NO voice recorder or answer input)
+                  <div className="ai-interviewer-status-panel">
+                    <div className="ai-status-header">
+                      <span className="ai-icon-large">🤖</span>
+                      <h3>AI Interviewer Active</h3>
+                      <div className={`ai-mode-badge ${aiInterviewerStatus}`}>
+                        {aiInterviewerStatus === 'speaking' && 'Speaking'}
+                        {aiInterviewerStatus === 'listening' && 'Listening'}
+                        {aiInterviewerStatus === 'analyzing' && 'Analyzing'}
+                        {aiInterviewerStatus === 'connected' && 'Connected'}
+                        {aiInterviewerStatus === 'complete' && 'Complete'}
+                      </div>
+                    </div>
+                    
+                    {/* Current Question Display */}
+                    <div className="current-question-panel">
+                      <div className="panel-label">Current AI Question:</div>
+                      <div className="question-text">
+                        {currentQuestion || "Waiting for AI to generate first question..."}
+                      </div>
+                      {currentQuestion && (
+                        <div className="question-meta-info">
+                          <span>📏 {currentQuestion.split(' ').length} words</span>
+                          <span>🎯 Based on participant's resume</span>
+                        </div>
+                      )}
+                    </div>
+                    
+                    {/* Question History */}
+                    {questionHistory.length > 0 && (
+                      <div className="question-history-panel">
+                        <div className="panel-label">Questions Asked ({questionHistory.length}):</div>
+                        <div className="history-list">
+                          {questionHistory.map((q, idx) => (
+                            <div key={idx} className="history-item">
+                              <span className="q-number">{idx + 1}</span>
+                              <span className="q-text">{q.length > 100 ? q.substring(0, 100) + '...' : q}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    
+                    {/* Resume Info */}
+                    {resumeData && (
+                      <div className="resume-info-panel">
+                        <div className="panel-label">Resume Info:</div>
+                        <div className="resume-details">
+                          <span>📄 {resumeData.filename}</span>
+                          <span>✓ Ready for AI interview</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 ) : (
                   <>
                     <video
@@ -2329,6 +2438,7 @@ const connectWebSocket = () => {
                 )}
               </div>
               
+              {/* PARTICIPANT VIDEO TILE */}
               <div className={`video-tile participant-tile ${isParticipantScreenSharing ? 'screen-share' : ''}`}>
                 <video
                   ref={participantVideoRef}
@@ -2528,12 +2638,6 @@ const connectWebSocket = () => {
                 Duration: {calculateDuration()} | AI: {aiConnected ? 'Connected' : 'Disconnected'} | 
                 Participant: {activeParticipants > 0 ? 'Connected' : 'Disconnected'} | 
                 Video: {participantStream ? 'Active' : 'Inactive'} | Status: {connectionStatus}
-                {signalingConnected && ' | Signaling Connected'}
-                {resumeData && ' | Resume Uploaded'}
-                {interviewMode === 'ai' && aiInterviewerActive && ' | AI Interviewer Active'}
-                {syncStatus === "synced" && ' | Mode Synced'}
-                {syncStatus === "requested" && ' | Syncing...'}
-                {referenceFaceSet && ' | Reference Face Set'}
               </small>
             </div>
           </div>
