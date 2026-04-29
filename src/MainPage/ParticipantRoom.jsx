@@ -262,13 +262,16 @@ function ParticipantRoom({ room, onLeave }) {
   const PYTHON_API_URL = 'http://localhost:8001';
   const NODE_API_URL = 'http://localhost:8000/api';
 
-  // Debug useEffect for question state
+  // Debug useEffect for question state and status
   useEffect(() => {
     console.log('🔍 Current question updated:', currentQuestion);
     console.log('🔍 Question history:', questionHistory);
     console.log('🔍 AI Interviewer active:', aiInterviewerActive);
     console.log('🔍 Interview mode:', interviewMode);
-  }, [currentQuestion, questionHistory, aiInterviewerActive, interviewMode]);
+    console.log('🔍 AI Interviewer Status:', aiInterviewerStatus);
+    console.log('🔍 Is Responding:', isResponding);
+    console.log('🔍 Textarea disabled:', aiInterviewerStatus !== "listening" || isResponding);
+  }, [currentQuestion, questionHistory, aiInterviewerActive, interviewMode, aiInterviewerStatus, isResponding]);
 
   const updateConnectionStatus = (status) => {
     setConnectionStatus(status);
@@ -585,12 +588,22 @@ function ParticipantRoom({ room, onLeave }) {
         }
       }
       
+      utterance.onstart = () => {
+        console.log('🗣️ TTS started');
+        setAiInterviewerStatus("speaking");
+      };
+      
       utterance.onend = () => {
         console.log('🗣️ TTS finished');
-        if (aiInterviewerStatus === 'speaking') {
-          setAiInterviewerStatus("listening");
-          startListeningForResponse();
-        }
+        // CRITICAL: Set status to listening after TTS completes
+        setAiInterviewerStatus("listening");
+        addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
+        startListeningForResponse();
+      };
+      
+      utterance.onerror = (event) => {
+        console.error('TTS error:', event);
+        setAiInterviewerStatus("listening");
       };
       
       window.speechSynthesis.speak(utterance);
@@ -669,7 +682,6 @@ function ParticipantRoom({ room, onLeave }) {
           if (result.next_question) {
             setTimeout(() => {
               setCurrentQuestion(result.next_question);
-              setAiInterviewerStatus("speaking");
               addMessage(result.next_question, 'ai_interviewer', new Date().toISOString());
               playTTS(result.next_question);
               setQuestionHistory(prev => [...prev, result.next_question]);
@@ -771,7 +783,6 @@ function ParticipantRoom({ room, onLeave }) {
   const toggleVoiceInput = () => {
     setShowVoiceInput(!showVoiceInput);
     if (!showVoiceInput && recognition) {
-      // Re-initialize recognition if turning on
       initializeSpeechRecognition();
     }
   };
@@ -879,7 +890,6 @@ function ParticipantRoom({ room, onLeave }) {
                 console.log('📝 Next question received:', data.next_question);
                 setTimeout(() => {
                   setCurrentQuestion(data.next_question);
-                  setAiInterviewerStatus("speaking");
                   addMessage(data.next_question, 'ai_interviewer', new Date().toISOString());
                   playTTS(data.next_question);
                   setQuestionHistory(prev => [...prev, data.next_question]);
@@ -890,7 +900,6 @@ function ParticipantRoom({ room, onLeave }) {
                 const finalMessage = `🎉 AI Interview Completed! Final Score: ${data.final_results.percentage}% - ${data.final_results.verdict}`;
                 addMessage(finalMessage, 'system', new Date().toISOString());
                 
-                // Show detailed feedback if available
                 if (data.final_results.category_scores) {
                   Object.entries(data.final_results.category_scores).forEach(([category, score]) => {
                     addMessage(`📊 ${category}: ${score}/10`, 'system', new Date().toISOString());
@@ -1914,7 +1923,6 @@ function ParticipantRoom({ room, onLeave }) {
         e.preventDefault();
         fileInputRef.current?.click();
       }
-      // Ctrl+V to toggle voice input
       if (e.ctrlKey && e.key === 'v' && aiInterviewerActive) {
         e.preventDefault();
         toggleVoiceInput();
@@ -2105,7 +2113,7 @@ function ParticipantRoom({ room, onLeave }) {
                     setAnswer={setResponseText}
                     disabled={aiInterviewerStatus !== "listening" || isResponding}
                     onSubmit={() => handleCandidateResponse(responseText)}
-                    isListeningForResponse={isListeningForResponse}
+                    isResponding={isResponding}
                     aiInterviewerStatus={aiInterviewerStatus}
                     currentQuestionNumber={questionHistory.length}
                     totalQuestions={10}
