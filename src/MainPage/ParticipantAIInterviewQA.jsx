@@ -38,6 +38,18 @@ function ParticipantAIInterviewQA({
   const currentUtteranceRef = useRef(null);
   const submitTimeoutRef = useRef(null);
   
+  // Debug logging for status changes
+  useEffect(() => {
+    console.log('🔍 ParticipantAIInterviewQA - Status:', {
+      aiInterviewerStatus,
+      isResponding,
+      disabled,
+      answerSubmitted,
+      answerLength: answer?.length || 0,
+      hasQuestion: !!question
+    });
+  }, [aiInterviewerStatus, isResponding, disabled, answerSubmitted, answer, question]);
+  
   // Calculate word and character counts
   useEffect(() => {
     const trimmedAnswer = answer?.trim() || "";
@@ -72,21 +84,17 @@ function ParticipantAIInterviewQA({
   
   // Speak question when AI is in speaking mode - ONLY ONCE per question
   useEffect(() => {
-    if (voiceEnabled && question && aiInterviewerStatus === 'speaking' && !hasSpokenQuestion) {
+    if (voiceEnabled && question && aiInterviewerStatus === 'speaking' && !hasSpokenQuestion && question !== "Waiting for AI question...") {
       setHasSpokenQuestion(true);
       speakQuestion();
     }
-    return () => {
-      if (currentUtteranceRef.current) {
-        window.speechSynthesis.cancel();
-      }
-    };
   }, [question, aiInterviewerStatus, voiceEnabled, hasSpokenQuestion]);
   
   // Reset hasSpokenQuestion when question changes
   useEffect(() => {
     setHasSpokenQuestion(false);
     setAnswerSubmitted(false);
+    setLocalResponding(false);
     // Clear any pending submit timeout
     if (submitTimeoutRef.current) {
       clearTimeout(submitTimeoutRef.current);
@@ -251,14 +259,6 @@ function ParticipantAIInterviewQA({
         if (onVoiceTranscript) {
           onVoiceTranscript(transcribedText);
         }
-        
-        // Auto-submit after transcription
-        if (transcribedText.trim() && aiInterviewerStatus === 'listening' && !localResponding && !isResponding && !answerSubmitted) {
-          // Small delay to allow user to see the transcribed text
-          submitTimeoutRef.current = setTimeout(() => {
-            handleSubmit();
-          }, 500);
-        }
       } else {
         setTranscriptionError(result.error || 'Failed to transcribe audio');
       }
@@ -276,8 +276,20 @@ function ParticipantAIInterviewQA({
       e.preventDefault();
       e.stopPropagation();
       
+      console.log('📤 Ctrl+Enter pressed - attempting submit');
+      
       if (!disabled && answer?.trim() && !isResponding && !localResponding && aiInterviewerStatus === 'listening' && !answerSubmitted) {
+        console.log('📤 Ctrl+Enter - conditions met, calling submit');
         handleSubmit();
+      } else {
+        console.log('📤 Ctrl+Enter - conditions not met:', {
+          disabled,
+          hasAnswer: !!answer?.trim(),
+          isResponding,
+          localResponding,
+          aiInterviewerStatus,
+          answerSubmitted
+        });
       }
     }
   };
@@ -285,6 +297,8 @@ function ParticipantAIInterviewQA({
   // Handle submit with debouncing to prevent double submission
   const handleSubmit = () => {
     const now = Date.now();
+    
+    console.log('📤 Submit called - checking conditions');
     
     // Prevent double submission within 3 seconds
     if (now - lastSubmitTime < 3000) {
@@ -302,6 +316,7 @@ function ParticipantAIInterviewQA({
     // Validate submission conditions
     if (disabled) {
       console.log('⚠️ Submit blocked: Component is disabled');
+      alert("Answer input is currently disabled. Please wait.");
       return;
     }
     
@@ -324,6 +339,7 @@ function ParticipantAIInterviewQA({
     
     if (isResponding || localResponding) {
       console.log('⚠️ Submit blocked: Already responding');
+      alert("Your answer is already being submitted. Please wait.");
       return;
     }
     
@@ -402,26 +418,27 @@ function ParticipantAIInterviewQA({
   // Determine if voice recording should be disabled
   const isVoiceDisabled = disabled || aiInterviewerStatus !== 'listening' || isResponding || localResponding || answerSubmitted;
   
+  // Determine if textarea is enabled
+  const isTextareaEnabled = aiInterviewerStatus === 'listening' && !isResponding && !disabled && !answerSubmitted;
+  
   // Get appropriate placeholder text
   const getPlaceholderText = () => {
     if (answerSubmitted) {
-      return "Answer submitted! Waiting for AI response...";
+      return "✓ Answer submitted! Waiting for AI response...";
     } else if (aiInterviewerStatus === 'listening') {
-      return "Type your answer here. Press Ctrl+Enter to submit.";
-    } else if (aiInterviewerStatus === 'speaking' || aiInterviewerStatus === 'generating') {
-      return "AI is speaking... Please wait for your turn.";
+      return "🎤 AI is listening! Type your answer here. Press Ctrl+Enter to submit.";
+    } else if (aiInterviewerStatus === 'speaking') {
+      return "🔊 AI is speaking... Please wait for your turn.";
     } else if (aiInterviewerStatus === 'analyzing') {
-      return "AI is analyzing your previous answer...";
+      return "🤔 AI is analyzing your previous answer...";
     } else if (aiInterviewerStatus === 'complete') {
-      return "Interview completed! Thank you for participating.";
+      return "✅ Interview completed! Thank you for participating.";
     } else if (aiInterviewerStatus === 'connected') {
-      return "AI Interviewer is ready. Waiting for first question...";
+      return "🤖 AI Interviewer is ready. Waiting for first question...";
     } else {
-      return "Type your answer here...";
+      return "📝 Type your answer here...";
     }
   };
-
-  const isTextareaEnabled = aiInterviewerStatus === 'listening' && !isResponding && !disabled && !answerSubmitted;
 
   return (
     <div className="participant-ai-qa-container">
@@ -533,10 +550,14 @@ function ParticipantAIInterviewQA({
           <span className="participant-label-icon">💬</span>
           Your Response
           {aiInterviewerStatus === 'listening' && !answerSubmitted && (
-            <span className="listening-badge">🎤 Ready for your answer</span>
+            <span className="listening-badge" style={{ backgroundColor: '#27ae60', color: 'white', padding: '2px 8px', borderRadius: '12px', marginLeft: '10px', fontSize: '11px' }}>
+              🎤 Ready for your answer
+            </span>
           )}
           {answerSubmitted && (
-            <span className="submitted-badge">✓ Answer Submitted</span>
+            <span className="submitted-badge" style={{ backgroundColor: '#4caf50', color: 'white', padding: '2px 8px', borderRadius: '12px', marginLeft: '10px', fontSize: '11px' }}>
+              ✓ Answer Submitted
+            </span>
           )}
         </div>
         
@@ -549,6 +570,10 @@ function ParticipantAIInterviewQA({
                 onClick={startRecording}
                 disabled={isVoiceDisabled || isTranscribing}
                 className={`voice-record-button ${aiInterviewerStatus === 'listening' && !isResponding && !localResponding && !answerSubmitted ? 'ready' : ''}`}
+                style={{
+                  opacity: (isVoiceDisabled || isTranscribing) ? 0.5 : 1,
+                  cursor: (isVoiceDisabled || isTranscribing) ? 'not-allowed' : 'pointer'
+                }}
               >
                 <span className="voice-icon">🎤</span>
                 {isTranscribing ? 'Transcribing...' : 'Record Voice Answer'}
@@ -586,6 +611,7 @@ function ParticipantAIInterviewQA({
             value={answer || ""}
             onChange={(e) => {
               if (isTextareaEnabled) {
+                console.log('✏️ Answer updated:', e.target.value.substring(0, 50));
                 setAnswer(e.target.value);
               }
             }}
@@ -593,6 +619,11 @@ function ParticipantAIInterviewQA({
             disabled={isTextareaDisabled}
             rows="5"
             maxLength="2000"
+            style={{
+              backgroundColor: isTextareaEnabled ? '#fff' : '#f5f5f5',
+              border: isTextareaEnabled ? '2px solid #27ae60' : '1px solid #ddd',
+              color: isTextareaEnabled ? '#333' : '#999'
+            }}
           />
           
           {/* Character Counter & Controls */}
@@ -609,6 +640,10 @@ function ParticipantAIInterviewQA({
                 className={`participant-submit-button ${!isSubmitDisabled ? 'active' : ''}`}
                 disabled={isSubmitDisabled}
                 onClick={handleSubmit}
+                style={{
+                  backgroundColor: !isSubmitDisabled ? '#27ae60' : '#ccc',
+                  cursor: !isSubmitDisabled ? 'pointer' : 'not-allowed'
+                }}
               >
                 {(isResponding || localResponding) ? (
                   <>
@@ -638,6 +673,7 @@ function ParticipantAIInterviewQA({
             <div 
               className="participant-tips-header"
               onClick={() => setShowTips(!showTips)}
+              style={{ cursor: 'pointer' }}
             >
               <span className="participant-tips-icon">💡</span>
               <span>Tips for a good answer</span>
