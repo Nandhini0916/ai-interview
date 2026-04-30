@@ -40,160 +40,6 @@ const ResumePreview = ({ isResumeUploaded, resumeFile, resumeText, resumeProcess
   );
 };
 
-// Voice Recording Component for Participant
-const VoiceAnswerRecorder = ({ onTranscript, disabled, isListeningForResponse, setAnswerText }) => {
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingTime, setRecordingTime] = useState(0);
-  const [isTranscribing, setIsTranscribing] = useState(false);
-  const [transcriptionError, setTranscriptionError] = useState(null);
-  
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  const timerRef = useRef(null);
-  const streamRef = useRef(null);
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-      }
-    };
-  }, []);
-
-  const startRecording = async () => {
-    if (disabled || !isListeningForResponse) {
-      alert("Please wait for AI to finish speaking before recording.");
-      return;
-    }
-
-    setTranscriptionError(null);
-    
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4'
-      });
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-      
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-      
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { 
-          type: mediaRecorder.mimeType || 'audio/webm' 
-        });
-        await transcribeAudio(audioBlob);
-        
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach(track => track.stop());
-          streamRef.current = null;
-        }
-      };
-      
-      mediaRecorder.start(100);
-      setIsRecording(true);
-      setRecordingTime(0);
-      
-      timerRef.current = setInterval(() => {
-        setRecordingTime(prev => prev + 1);
-      }, 1000);
-      
-    } catch (err) {
-      console.error('Error accessing microphone:', err);
-      alert('Could not access microphone. Please check permissions.');
-    }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-    }
-  };
-
-  const transcribeAudio = async (blob) => {
-    setIsTranscribing(true);
-    
-    try {
-      const formData = new FormData();
-      formData.append('audio', blob, 'recording.webm');
-      
-      const response = await fetch('http://localhost:8001/voice/transcribe', {
-        method: 'POST',
-        body: formData
-      });
-      
-      const result = await response.json();
-      
-      if (result.success && result.text) {
-        if (onTranscript) {
-          onTranscript(result.text);
-        }
-        if (setAnswerText) {
-          setAnswerText(result.text);
-        }
-      } else {
-        setTranscriptionError(result.error || 'Failed to transcribe audio');
-      }
-    } catch (err) {
-      console.error('Transcription error:', err);
-      setTranscriptionError('Network error. Please try typing your answer.');
-    } finally {
-      setIsTranscribing(false);
-    }
-  };
-
-  const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
-  };
-
-  return (
-    <div className="participant-voice-recorder">
-      {!isRecording ? (
-        <button
-          type="button"
-          onClick={startRecording}
-          disabled={disabled || !isListeningForResponse || isTranscribing}
-          className={`voice-record-button ${isListeningForResponse ? 'ready' : ''}`}
-        >
-          <span className="voice-icon">🎤</span>
-          {isTranscribing ? 'Transcribing...' : 'Record Voice Answer'}
-        </button>
-      ) : (
-        <div className="recording-controls">
-          <div className="recording-indicator">
-            <span className="recording-dot"></span>
-            <span className="recording-time">{formatTime(recordingTime)}</span>
-          </div>
-          <button onClick={stopRecording} className="stop-record-button">
-            ⏹️ Stop Recording
-          </button>
-        </div>
-      )}
-      
-      {transcriptionError && (
-        <div className="transcription-error">
-          ⚠️ {transcriptionError}
-        </div>
-      )}
-    </div>
-  );
-};
-
 function ParticipantRoom({ room, onLeave }) {
   const [mediaStream, setMediaStream] = useState(null);
   const [screenStream, setScreenStream] = useState(null);
@@ -216,6 +62,7 @@ function ParticipantRoom({ room, onLeave }) {
   const [interviewerConnected, setInterviewerConnected] = useState(false);
   const [connectionRetryCount, setConnectionRetryCount] = useState(0);
   const [isExplicitlyClosing, setIsExplicitlyClosing] = useState(false);
+  const [frameCount, setFrameCount] = useState(0);
   
   // Enhanced AI Interviewer states
   const [aiInterviewerActive, setAiInterviewerActive] = useState(false);
@@ -483,191 +330,54 @@ function ParticipantRoom({ room, onLeave }) {
     }
   };
 
+  // Handle voice transcript - FIXED
   const handleVoiceTranscript = (transcript) => {
+    console.log('🎤 Voice transcript received:', transcript);
     if (transcript && transcript.trim()) {
-      setResponseText(transcript);
-      // Auto-submit after short delay
-      setTimeout(() => {
-        if (transcript.trim() && aiInterviewerStatus === "listening" && !isResponding) {
-          handleCandidateResponse(transcript);
-        }
-      }, 500);
-    }
-  };
-
-  const initializeSpeechRecognition = () => {
-    if (!voiceEnabled) return;
-    
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      const recognitionInstance = new SpeechRecognition();
-      recognitionInstance.continuous = false;
-      recognitionInstance.interimResults = true;
-      recognitionInstance.lang = 'en-US';
-      recognitionInstance.maxAlternatives = 1;
-      
-      recognitionInstance.onstart = () => {
-        console.log('🎤 Speech recognition started');
-        setIsListeningForResponse(true);
-        addMessage("🎤 Listening for your response...", 'system', new Date().toISOString());
-      };
-      
-      recognitionInstance.onresult = (event) => {
-        let interimTranscript = '';
-        let finalTranscript = '';
-        
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalTranscript += transcript;
-          } else {
-            interimTranscript += transcript;
-          }
-        }
-        
-        if (finalTranscript) {
-          console.log('🎤 Speech recognized:', finalTranscript);
-          setResponseText(finalTranscript);
-          recognitionInstance.stop();
-          handleCandidateResponse(finalTranscript);
-        } else if (interimTranscript) {
-          setResponseText(interimTranscript);
-        }
-      };
-      
-      recognitionInstance.onerror = (event) => {
-        console.error('🎤 Speech recognition error:', event.error);
-        setIsListeningForResponse(false);
-        clearTimeout(responseTimeout);
-        
-        if (event.error !== 'no-speech') {
-          addMessage("⚠️ Speech recognition failed. Please type your response or use the record button.", 'system', new Date().toISOString());
-        }
-      };
-      
-      recognitionInstance.onend = () => {
-        console.log('🎤 Speech recognition ended');
-        setIsListeningForResponse(false);
-        clearTimeout(responseTimeout);
-      };
-      
-      setRecognition(recognitionInstance);
-    } else {
-      console.warn('🎤 Speech recognition not supported in this browser');
-      addMessage("⚠️ Voice input not fully supported. Please use the record button or type your responses.", 'system', new Date().toISOString());
-    }
-  };
-
-  // Updated playTTS function with proper status handling
-  const playTTS = (text) => {
-    if (!voiceEnabled || !text) return;
-    
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-      
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 0.95;
-      utterance.pitch = 1.0;
-      utterance.volume = 1.0;
-      utterance.lang = 'en-US';
-      
-      const voices = window.speechSynthesis.getVoices();
-      if (voices.length > 0) {
-        const preferredVoice = voices.find(voice => 
-          voice.lang.includes('en') && !voice.name.includes('Microsoft')
-        );
-        if (preferredVoice) {
-          utterance.voice = preferredVoice;
-        }
+      // Append to existing response text
+      if (responseText && responseText.trim()) {
+        setResponseText(responseText + " " + transcript);
+      } else {
+        setResponseText(transcript);
       }
-      
-      utterance.onstart = () => {
-        console.log('🗣️ TTS started');
-        setAiInterviewerStatus("speaking");
-        setIsListeningForResponse(false);
-      };
-      
-      utterance.onend = () => {
-        console.log('🗣️ TTS finished');
-        setAiInterviewerStatus("listening");
-        setIsListeningForResponse(true);
-        addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-      };
-      
-      utterance.onerror = (event) => {
-        console.error('TTS error:', event);
-        setAiInterviewerStatus("listening");
-        setIsListeningForResponse(true);
-        addMessage("👂 AI is ready. Please type or record your answer.", 'system', new Date().toISOString());
-      };
-      
-      window.speechSynthesis.speak(utterance);
-      console.log('🗣️ Playing TTS for AI question');
-    } else {
-      // Fallback if speech synthesis not available
-      setAiInterviewerStatus("listening");
-      setIsListeningForResponse(true);
-      addMessage("👂 AI is waiting for your response. Please type your answer.", 'system', new Date().toISOString());
     }
   };
 
-  const startListeningForResponse = () => {
-    if (aiInterviewerStatus !== "listening") {
-      console.log('Not listening because status is:', aiInterviewerStatus);
-      return;
-    }
-    
-    if (!voiceEnabled) {
-      addMessage("👂 AI is waiting for your response. Please type your answer.", 'system', new Date().toISOString());
-      return;
-    }
-    
-    if (recognition) {
-      try {
-        recognition.start();
-        setIsListeningForResponse(true);
-        
-        const timeout = setTimeout(() => {
-          if (recognition) {
-            recognition.stop();
-          }
-          setIsListeningForResponse(false);
-          console.log('⏰ Response timeout reached');
-          addMessage("⏰ Response timeout. Please use the record button or type your response.", 'system', new Date().toISOString());
-          
-          if (aiWsRef.current && aiWsRef.current.readyState === WebSocket.OPEN) {
-            aiWsRef.current.send(JSON.stringify({
-              type: 'response_timeout',
-              session_id: currentSessionId
-            }));
-          }
-        }, 45000);
-        
-        setResponseTimeout(timeout);
-        
-      } catch (error) {
-        console.error('🎤 Error starting speech recognition:', error);
-        addMessage("❌ Could not start voice input. Please use the record button or type instead.", 'system', new Date().toISOString());
-      }
-    } else {
-      addMessage("👂 AI is waiting for your response. Please use the record button or type your answer.", 'system', new Date().toISOString());
-    }
-  };
-
-  // Updated handleCandidateResponse
+  // Handle candidate response submission - FIXED
   const handleCandidateResponse = async (response) => {
-    if (!response.trim() || !aiInterviewerActive || !currentQuestion) {
-      console.warn('⚠️ Cannot submit response - missing:', {
-        hasResponse: !!response.trim(),
-        aiActive: aiInterviewerActive,
-        hasQuestion: !!currentQuestion
-      });
-      addMessage("⚠️ Cannot submit response. Please wait for a question.", 'system', new Date().toISOString());
+    if (!response.trim()) {
+      console.warn('⚠️ Cannot submit empty response');
+      addMessage("⚠️ Please provide an answer before submitting.", 'system', new Date().toISOString());
+      return;
+    }
+    
+    if (!aiInterviewerActive) {
+      console.warn('⚠️ Cannot submit - AI Interviewer not active');
+      addMessage("⚠️ AI Interviewer is not active. Please wait for the interviewer to start the AI session.", 'system', new Date().toISOString());
+      return;
+    }
+    
+    if (!currentQuestion) {
+      console.warn('⚠️ Cannot submit - No current question');
+      addMessage("⚠️ No question available. Please wait for the AI to ask a question.", 'system', new Date().toISOString());
       return;
     }
     
     if (aiInterviewerStatus !== "listening") {
-      addMessage(`⚠️ Please wait - AI is currently ${aiInterviewerStatus}.`, 'system', new Date().toISOString());
+      const statusMessages = {
+        'speaking': 'Please wait for AI to finish speaking before submitting.',
+        'analyzing': 'AI is analyzing your previous answer. Please wait.',
+        'idle': 'AI Interviewer is not active. Please wait for a question.',
+        'complete': 'Interview is complete. Thank you for participating!',
+        'connected': 'AI is preparing your first question. Please wait...'
+      };
+      addMessage(`⚠️ ${statusMessages[aiInterviewerStatus] || `AI is currently ${aiInterviewerStatus}. Please wait.`}`, 'system', new Date().toISOString());
+      return;
+    }
+    
+    // Prevent double submission
+    if (isResponding) {
+      console.warn('⚠️ Already submitting an answer');
       return;
     }
     
@@ -679,16 +389,31 @@ function ParticipantRoom({ room, onLeave }) {
       setResponseTimeout(null);
     }
     
+    // Stop speech recognition if active
+    if (recognition) {
+      try {
+        recognition.stop();
+      } catch (e) {
+        console.warn('Error stopping recognition:', e);
+      }
+    }
+    
     try {
       console.log('📝 Processing candidate response:', response.substring(0, 100));
       console.log('📝 Current question:', currentQuestion.substring(0, 100));
       console.log('📝 Session ID:', currentSessionId);
       
+      // Add answer to chat
       addMessage(response, 'participant', new Date().toISOString());
+      
+      // Clear response text
       setResponseText("");
+      
+      // Set status to analyzing
       setAiInterviewerStatus("analyzing");
       addMessage("🤖 AI is analyzing your response...", 'system', new Date().toISOString());
       
+      // Submit via REST API
       const submitResponse = await fetch(`${PYTHON_API_URL}/submit_ai_answer`, {
         method: "POST",
         headers: { 
@@ -702,104 +427,113 @@ function ParticipantRoom({ room, onLeave }) {
         })
       });
       
-      let result = null;
-      if (submitResponse.ok) {
-        result = await submitResponse.json();
-        console.log('✅ Answer submitted via REST API:', result);
-      } else {
+      if (!submitResponse.ok) {
         const errorText = await submitResponse.text();
-        console.error('❌ REST API submission failed:', errorText);
-        throw new Error(`HTTP ${submitResponse.status}: ${errorText}`);
+        console.error('❌ API submission failed:', errorText);
+        throw new Error(`HTTP ${submitResponse.status}: ${errorText.substring(0, 200)}`);
       }
       
-      if (result) {
-        if (result.score !== undefined) {
-          const feedbackMessage = `📊 Score: ${result.score}/10 - ${result.feedback || 'Good response!'}`;
-          setResponseAnalysis({ score: result.score, feedback: result.feedback });
-          addMessage(feedbackMessage, 'system', new Date().toISOString());
-        }
+      const result = await submitResponse.json();
+      console.log('✅ Answer submitted, result:', result);
+      
+      // Show feedback
+      if (result.score !== undefined) {
+        const feedbackMessage = `📊 Score: ${result.score}/10 - ${result.feedback || 'Good response!'}`;
+        setResponseAnalysis({ score: result.score, feedback: result.feedback });
+        addMessage(feedbackMessage, 'system', new Date().toISOString());
+      }
+      
+      // Handle next question or completion
+      if (result.next_question) {
+        console.log('📝 Next question received:', result.next_question);
         
-        if (result.next_question) {
-          console.log('📝 Next question received:', result.next_question);
-          setAiInterviewerStatus("speaking");
-          setIsListeningForResponse(false);
+        // Update status to speaking for next question
+        setAiInterviewerStatus("speaking");
+        
+        // Show next question after delay
+        setTimeout(() => {
+          setCurrentQuestion(result.next_question);
+          addMessage(result.next_question, 'ai_interviewer', new Date().toISOString());
+          setQuestionHistory(prev => [...prev, result.next_question]);
           
-          setTimeout(() => {
-            setCurrentQuestion(result.next_question);
-            addMessage(result.next_question, 'ai_interviewer', new Date().toISOString());
-            setQuestionHistory(prev => [...prev, result.next_question]);
+          // Play TTS for next question
+          if (voiceEnabled && 'speechSynthesis' in window) {
+            const utterance = new SpeechSynthesisUtterance(result.next_question);
+            utterance.rate = 0.95;
+            utterance.pitch = 1.0;
+            utterance.volume = 1.0;
+            utterance.lang = 'en-US';
             
-            if (voiceEnabled && 'speechSynthesis' in window) {
-              const utterance = new SpeechSynthesisUtterance(result.next_question);
-              utterance.rate = 0.95;
-              utterance.pitch = 1.0;
-              utterance.volume = 1.0;
-              utterance.lang = 'en-US';
-              
-              utterance.onstart = () => {
-                setAiInterviewerStatus("speaking");
-                setIsListeningForResponse(false);
-              };
-              
-              utterance.onend = () => {
-                setAiInterviewerStatus("listening");
-                setIsListeningForResponse(true);
-                addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-              };
-              
-              utterance.onerror = () => {
-                setAiInterviewerStatus("listening");
-                setIsListeningForResponse(true);
-              };
-              
-              window.speechSynthesis.speak(utterance);
-            } else {
-              setTimeout(() => {
-                setAiInterviewerStatus("listening");
-                setIsListeningForResponse(true);
-                addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-              }, 2000);
+            // Get available voices
+            const voices = window.speechSynthesis.getVoices();
+            const preferredVoice = voices.find(voice => 
+              voice.lang === 'en-US' && !voice.name.includes('Microsoft') && voice.name.includes('Google')
+            ) || voices.find(voice => voice.lang === 'en-US');
+            if (preferredVoice) {
+              utterance.voice = preferredVoice;
             }
-          }, 1000);
-          
-        } else if (result.is_complete || result.final_results) {
-          console.log('🎉 Final results received:', result.final_results);
-          setAiInterviewerStatus("complete");
-          setIsListeningForResponse(false);
-          const finalMessage = `🎉 AI Interview Completed! Final Score: ${result.final_results?.percentage || result.percentage || 'N/A'}%`;
-          addMessage(finalMessage, 'system', new Date().toISOString());
-          
-          setTimeout(() => {
-            setCurrentQuestion("");
-            setAiInterviewerActive(false);
-            setAiInterviewerStatus("idle");
-          }, 5000);
-        } else if (!result.next_question && !result.is_complete) {
-          console.warn('⚠️ No next question provided by backend');
-          addMessage("⚠️ Waiting for next question from AI...", 'system', new Date().toISOString());
-          
-          setTimeout(() => {
-            if (aiInterviewerActive && !result.is_complete) {
-              requestAIQuestion();
-            }
-          }, 2000);
-        }
-      }
-      
-      if (aiWsRef.current && aiWsRef.current.readyState === WebSocket.OPEN) {
-        aiWsRef.current.send(JSON.stringify({
-          type: 'command',
-          command: 'submit_ai_answer',
-          session_id: currentSessionId,
-          question: currentQuestion,
-          answer: response,
-          timestamp: new Date().toISOString()
-        }));
+            
+            utterance.onstart = () => {
+              setAiInterviewerStatus("speaking");
+              setIsListeningForResponse(false);
+            };
+            
+            utterance.onend = () => {
+              setAiInterviewerStatus("listening");
+              setIsListeningForResponse(true);
+              addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
+            };
+            
+            utterance.onerror = () => {
+              setAiInterviewerStatus("listening");
+              setIsListeningForResponse(true);
+            };
+            
+            window.speechSynthesis.speak(utterance);
+          } else {
+            // If TTS not available, just switch to listening after delay
+            setTimeout(() => {
+              setAiInterviewerStatus("listening");
+              setIsListeningForResponse(true);
+              addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
+            }, 2000);
+          }
+        }, 1000);
+        
+      } else if (result.is_complete || result.final_results) {
+        console.log('🎉 Interview completed!');
+        setAiInterviewerStatus("complete");
+        setIsListeningForResponse(false);
+        
+        const finalMessage = `🎉 AI Interview Completed! Final Score: ${result.final_results?.percentage || result.percentage || 'N/A'}%`;
+        addMessage(finalMessage, 'system', new Date().toISOString());
+        
+        // Stop AI interviewer after completion
+        setTimeout(() => {
+          setCurrentQuestion("");
+          setAiInterviewerActive(false);
+          setAiInterviewerStatus("idle");
+        }, 5000);
+        
+      } else {
+        // No next question but not complete - request one
+        console.warn('⚠️ No next question provided, requesting...');
+        addMessage("🔄 Loading next question...", 'system', new Date().toISOString());
+        
+        setTimeout(() => {
+          if (aiInterviewerActive) {
+            requestAIQuestion();
+            // Set to listening while waiting
+            setAiInterviewerStatus("listening");
+            setIsListeningForResponse(true);
+          }
+        }, 2000);
       }
       
     } catch (error) {
       console.error('❌ Error handling candidate response:', error);
       addMessage(`❌ Error sending response: ${error.message}`, 'system', new Date().toISOString());
+      // Reset to listening state on error
       setAiInterviewerStatus("listening");
       setIsListeningForResponse(true);
     } finally {
@@ -808,27 +542,77 @@ function ParticipantRoom({ room, onLeave }) {
   };
 
   const requestAIQuestion = () => {
-    if (!aiInterviewerActive || !currentSessionId || !webrtcManagerRef.current || webrtcManagerRef.current.isClosed) {
+    if (!aiInterviewerActive || !currentSessionId) {
       console.warn('⚠️ Cannot request AI question - prerequisites not met');
       return;
     }
     
-    console.log('📥 Requesting AI question from interviewer...');
+    console.log('📥 Requesting AI question from backend...');
     
-    if (webrtcManagerRef.current.isDataChannelOpen('chat')) {
-      webrtcManagerRef.current.sendData('chat', {
-        type: 'request_ai_question',
+    // Request via REST API
+    fetch(`${PYTHON_API_URL}/start_ai_interview`, {
+      method: "POST",
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
         session_id: currentSessionId,
-        room_id: room.id,
-        timestamp: new Date().toISOString(),
-        message: 'Participant requesting AI question'
-      });
-    }
-    
-    webrtcManagerRef.current.sendChatMessage(
-      "🤖 Ready for AI question",
-      `ready-${Date.now()}`
-    );
+        level: "medium",
+        room_id: room.id
+      })
+    })
+    .then(res => res.json())
+    .then(data => {
+      if (data.status === "success" && data.questions && data.questions.length > 0) {
+        console.log('📝 Got next question via REST:', data.questions[0]);
+        const nextQuestion = data.questions[questionHistory.length] || data.questions[0];
+        
+        setCurrentQuestion(nextQuestion);
+        addMessage(nextQuestion, 'ai_interviewer', new Date().toISOString());
+        setQuestionHistory(prev => [...prev, nextQuestion]);
+        
+        setAiInterviewerStatus("speaking");
+        setIsListeningForResponse(false);
+        
+        if (voiceEnabled && 'speechSynthesis' in window) {
+          const utterance = new SpeechSynthesisUtterance(nextQuestion);
+          utterance.rate = 0.95;
+          utterance.pitch = 1.0;
+          utterance.volume = 1.0;
+          utterance.lang = 'en-US';
+          
+          const voices = window.speechSynthesis.getVoices();
+          const preferredVoice = voices.find(voice => 
+            voice.lang === 'en-US' && !voice.name.includes('Microsoft') && voice.name.includes('Google')
+          ) || voices.find(voice => voice.lang === 'en-US');
+          if (preferredVoice) utterance.voice = preferredVoice;
+          
+          utterance.onstart = () => {
+            setAiInterviewerStatus("speaking");
+          };
+          
+          utterance.onend = () => {
+            setAiInterviewerStatus("listening");
+            setIsListeningForResponse(true);
+            addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
+          };
+          
+          window.speechSynthesis.speak(utterance);
+        } else {
+          setTimeout(() => {
+            setAiInterviewerStatus("listening");
+            setIsListeningForResponse(true);
+          }, 2000);
+        }
+      } else {
+        console.warn('⚠️ No question received from REST API');
+        setAiInterviewerStatus("listening");
+        setIsListeningForResponse(true);
+      }
+    })
+    .catch(err => {
+      console.error('❌ Failed to request next question:', err);
+      setAiInterviewerStatus("listening");
+      setIsListeningForResponse(true);
+    });
   };
 
   const toggleVoiceInput = () => {
@@ -841,6 +625,16 @@ function ParticipantRoom({ room, onLeave }) {
   const connectToAIInterviewer = () => {
     if (isExplicitlyClosing) return;
     
+    if (aiWsRef.current && aiWsRef.current.readyState === WebSocket.OPEN) {
+      console.log('AI WebSocket already connected');
+      return;
+    }
+    
+    if (aiWsRef.current && aiWsRef.current.readyState === WebSocket.CONNECTING) {
+      console.log('AI WebSocket already connecting');
+      return;
+    }
+    
     try {
       if (aiWsRef.current) {
         if (aiWsRef.current.pingInterval) clearInterval(aiWsRef.current.pingInterval);
@@ -848,18 +642,16 @@ function ParticipantRoom({ room, onLeave }) {
         aiWsRef.current.close();
       }
       
+      console.log('🔌 Connecting to AI WebSocket at ws://localhost:8001/ws');
       const ws = new WebSocket("ws://localhost:8001/ws");
       let pingInterval = null;
       let pongTimeout = null;
       
       ws.onopen = () => {
-        console.log("✅ Connected to AI Interviewer WebSocket");
-        setAiInterviewerActive(true);
-        setAiInterviewerStatus("connected");
+        console.log("✅ Connected to AI WebSocket");
         
         pingInterval = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
-            console.log("📡 Sending ping to AI server");
             ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
             if (pongTimeout) clearTimeout(pongTimeout);
             pongTimeout = setTimeout(() => {
@@ -867,31 +659,26 @@ function ParticipantRoom({ room, onLeave }) {
               if (ws.readyState === WebSocket.OPEN) ws.close();
             }, 10000);
           }
-        }, 20000);
+        }, 25000);
         
-        ws.send(JSON.stringify({
-          type: 'command',
-          command: 'register_session',
-          session_id: currentSessionId,
-          room_id: room.id
-        }));
-        
-        if (isResumeUploaded) {
+        if (currentSessionId) {
+          console.log('📝 Registering session:', currentSessionId);
+          ws.send(JSON.stringify({
+            type: 'register_session',
+            session_id: currentSessionId,
+            room_id: room.id
+          }));
+          
           setTimeout(() => {
-            if (!isExplicitlyClosing && ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: 'command',
-                command: 'start_ai_interview',
-                session_id: currentSessionId,
-                level: 'medium',
-                room_id: room.id,
-                use_voice: voiceEnabled
-              }));
+            if (ws.readyState === WebSocket.OPEN) {
+              setAiInterviewerActive(true);
+              setAiInterviewerStatus("connected");
+              console.log('🤖 AI Interviewer connected and registered');
             }
-          }, 1000);
+          }, 500);
         } else {
-          console.log("📄 Resume not uploaded yet. AI interview will start when resume is uploaded.");
-          addMessage("📄 Please upload your resume. The AI interview will begin automatically.", 'system', new Date().toISOString());
+          console.warn('⚠️ No session ID available for registration');
+          setAiInterviewerStatus("idle");
         }
         
         addMessage("🤖 Connected to AI Interviewer", 'system', new Date().toISOString());
@@ -913,136 +700,192 @@ function ParticipantRoom({ room, onLeave }) {
             return;
           }
           
-          console.log("🤖 AI Interviewer Message:", data.type);
+          console.log("🤖 AI WebSocket Message:", data.type);
           
           switch (data.type) {
-            case 'ai_interview_started':
-              console.log('🤖 AI interview started:', data);
+            case 'session_registered':
+              console.log('✅ Session registered successfully:', data);
               setAiInterviewerActive(true);
-              setAiInterviewerStatus("speaking");
-              addMessage("🎬 AI Interview Started", 'system', new Date().toISOString());
+              setAiInterviewerStatus("connected");
               
-              if (data.questions && data.questions.length > 0) {
-                console.log('📝 Setting first question:', data.questions[0]);
-                setCurrentQuestion(data.questions[0]);
-                addMessage(data.questions[0], 'ai_interviewer', new Date().toISOString());
-                setQuestionHistory([data.questions[0]]);
-                playTTS(data.questions[0]);
+              if (isResumeUploaded && !currentQuestion) {
+                console.log('📄 Resume uploaded, starting AI interview...');
+                setTimeout(() => {
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                      type: 'command',
+                      command: 'start_ai_interview',
+                      session_id: currentSessionId,
+                      level: 'medium',
+                      room_id: room.id,
+                      use_voice: voiceEnabled
+                    }));
+                  }
+                }, 1000);
+              } else if (!isResumeUploaded) {
+                addMessage("📄 Please upload your resume to start the AI interview.", 'system', new Date().toISOString());
+                setAiInterviewerStatus("idle");
               }
               break;
               
-            case 'ai_answer_feedback':
-              console.log('🤖 AI answer feedback received:', data);
-              setAiInterviewerStatus("analyzing");
-              setIsListeningForResponse(false);
-  
-              if (data.score !== undefined) {
-                const feedbackMessage = `📊 Score: ${data.score}/10 - ${data.feedback || 'Good response!'}`;
-                setResponseAnalysis({ score: data.score, feedback: data.feedback });
-                addMessage(feedbackMessage, 'system', new Date().toISOString());
-                console.log('📊 Score received:', data.score);
-              }
-  
-              if (data.next_question) {
-                console.log('📝 Next question received via WebSocket:', data.next_question);
+            case 'interview_started':
+              console.log('🎬 AI interview started:', data);
+              setAiInterviewerActive(true);
+              
+              if (data.questions && data.questions.length > 0) {
+                const firstQuestion = data.questions[0];
+                console.log('📝 Setting first question:', firstQuestion);
+                setCurrentQuestion(firstQuestion);
+                addMessage(firstQuestion, 'ai_interviewer', new Date().toISOString());
+                setQuestionHistory([firstQuestion]);
+                
                 setAiInterviewerStatus("speaking");
                 setIsListeningForResponse(false);
+                
+                if (voiceEnabled && 'speechSynthesis' in window) {
+                  const utterance = new SpeechSynthesisUtterance(firstQuestion);
+                  utterance.rate = 0.95;
+                  utterance.pitch = 1.0;
+                  utterance.volume = 1.0;
+                  utterance.lang = 'en-US';
+                  
+                  const voices = window.speechSynthesis.getVoices();
+                  if (voices.length > 0) {
+                    const preferredVoice = voices.find(voice => 
+                      voice.lang.includes('en') && !voice.name.includes('Microsoft')
+                    );
+                    if (preferredVoice) utterance.voice = preferredVoice;
+                  }
+                  
+                  utterance.onstart = () => {
+                    setAiInterviewerStatus("speaking");
+                    setIsListeningForResponse(false);
+                  };
+                  
+                  utterance.onend = () => {
+                    setAiInterviewerStatus("listening");
+                    setIsListeningForResponse(true);
+                    addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
+                  };
+                  
+                  utterance.onerror = () => {
+                    setAiInterviewerStatus("listening");
+                    setIsListeningForResponse(true);
+                  };
+                  
+                  window.speechSynthesis.speak(utterance);
+                } else {
+                  setTimeout(() => {
+                    setAiInterviewerStatus("listening");
+                    setIsListeningForResponse(true);
+                  }, 3000);
+                }
+              }
+              break;
+              
+            case 'answer_result':
+              console.log('📊 Answer result received:', data);
+              
+              if (data.score !== undefined) {
+                addMessage(`📊 Score: ${data.score}/10 - ${data.feedback || 'Good response!'}`, 'system', new Date().toISOString());
+              }
+              
+              if (data.next_question) {
+                setAiInterviewerStatus("speaking");
+                setIsListeningForResponse(false);
+                
                 setTimeout(() => {
                   setCurrentQuestion(data.next_question);
                   addMessage(data.next_question, 'ai_interviewer', new Date().toISOString());
-                  playTTS(data.next_question);
                   setQuestionHistory(prev => [...prev, data.next_question]);
-                }, 2000);
-              } else if (data.final_results) {
-                console.log('🎉 Final results received:', data.final_results);
+                  
+                  if (voiceEnabled && 'speechSynthesis' in window) {
+                    const utterance = new SpeechSynthesisUtterance(data.next_question);
+                    utterance.rate = 0.95;
+                    utterance.pitch = 1.0;
+                    utterance.volume = 1.0;
+                    utterance.lang = 'en-US';
+                    
+                    utterance.onstart = () => {
+                      setAiInterviewerStatus("speaking");
+                    };
+                    utterance.onend = () => {
+                      setAiInterviewerStatus("listening");
+                      setIsListeningForResponse(true);
+                    };
+                    window.speechSynthesis.speak(utterance);
+                  } else {
+                    setTimeout(() => {
+                      setAiInterviewerStatus("listening");
+                      setIsListeningForResponse(true);
+                    }, 2000);
+                  }
+                }, 1000);
+              } else if (data.is_complete) {
                 setAiInterviewerStatus("complete");
                 setIsListeningForResponse(false);
-                const finalMessage = `🎉 AI Interview Completed! Final Score: ${data.final_results.percentage}% - ${data.final_results.verdict}`;
-                addMessage(finalMessage, 'system', new Date().toISOString());
-                
-                if (data.final_results.category_scores) {
-                  Object.entries(data.final_results.category_scores).forEach(([category, score]) => {
-                    addMessage(`📊 ${category}: ${score}/10`, 'system', new Date().toISOString());
-                  });
-                }
-                
-                setTimeout(() => {
-                  setAiInterviewerActive(false);
-                  setAiInterviewerStatus("idle");
-                  setCurrentQuestion("");
-                  setQuestionHistory([]);
-                }, 8000);
+                addMessage(`🎉 Interview Completed!`, 'system', new Date().toISOString());
               }
               break;
               
-            case 'new_question':
-              console.log('📝 New question from AI:', data.question);
-              setCurrentQuestion(data.question);
-              addMessage(data.question, 'ai_interviewer', new Date().toISOString());
-              playTTS(data.question);
-              setQuestionHistory(prev => [...prev, data.question]);
+            case 'detection':
+              // Handle detection results silently
+              if (data.faces !== undefined) {
+                console.log('🔍 Detection update:', data.faces, 'faces,', data.gender);
+              }
               break;
               
-            case 'ai_interview_error':
-              console.error('❌ AI Interview Error:', data.message);
-              setAiInterviewerStatus("error");
-              setIsResponding(false);
-              setIsListeningForResponse(false);
-              addMessage(`❌ AI Error: ${data.message}`, 'system', new Date().toISOString());
-              break;
-              
-            case 'fraud_alert':
-              console.warn('⚠️ Fraud alert:', data.message);
-              addMessage(`⚠️ AI Alert: ${data.message}`, 'system', new Date().toISOString());
+            case 'error':
+              console.error('❌ AI Error:', data.message);
+              setAiInterviewerStatus("listening");
+              setIsListeningForResponse(true);
+              addMessage(`⚠️ ${data.message}`, 'system', new Date().toISOString());
               break;
               
             default:
-              if (data.faces !== undefined) {
-                console.log('🔍 Detection data:', data);
-              }
+              console.log('📨 Unknown message type:', data.type);
           }
         } catch (err) {
-          console.error("❌ Error parsing AI Interviewer message:", err);
+          console.error("❌ Error parsing AI message:", err);
         }
       };
       
-      ws.onclose = () => {
-        console.log("🔌 AI Interviewer WebSocket disconnected");
+      ws.onclose = (event) => {
+        console.log("🔌 AI WebSocket disconnected:", event.code, event.reason);
         if (pingInterval) clearInterval(pingInterval);
         if (pongTimeout) clearTimeout(pongTimeout);
+        
         setAiInterviewerActive(false);
-        setAiInterviewerStatus("idle");
-        setCurrentQuestion("");
-        setQuestionHistory([]);
-        setResponseAnalysis(null);
-        setIsResponding(false);
+        setAiInterviewerStatus("disconnected");
         setIsListeningForResponse(false);
         addMessage("🔌 AI Interviewer disconnected", 'system', new Date().toISOString());
+        
+        setTimeout(() => {
+          if (!isExplicitlyClosing && interviewMode === "ai" && !aiInterviewerActive) {
+            console.log("🔄 Attempting to reconnect to AI...");
+            connectToAIInterviewer();
+          }
+        }, 3000);
       };
       
       ws.onerror = (error) => {
-        console.error("❌ AI Interviewer WebSocket error:", error);
-        setAiInterviewerActive(false);
+        console.error("❌ AI WebSocket error:", error);
         setAiInterviewerStatus("error");
-        setIsResponding(false);
-        setIsListeningForResponse(false);
-        addMessage("❌ AI Interviewer connection error", 'system', new Date().toISOString());
+        addMessage("❌ AI connection error", 'system', new Date().toISOString());
       };
       
       aiWsRef.current = ws;
       aiWsRef.current.pingInterval = pingInterval;
       aiWsRef.current.pongTimeout = pongTimeout;
+      
     } catch (err) {
-      console.error("❌ AI Interviewer WebSocket connection failed:", err);
+      console.error("❌ AI WebSocket connection failed:", err);
       setAiInterviewerActive(false);
       setAiInterviewerStatus("error");
-      setIsResponding(false);
-      setIsListeningForResponse(false);
-      addMessage("❌ Failed to connect to AI Interviewer", 'system', new Date().toISOString());
+      addMessage("❌ Failed to connect to AI", 'system', new Date().toISOString());
     }
   };
 
-  // Updated handleWebRTCMessage for proper status handling
   const handleWebRTCMessage = (data) => {
     console.log('📨 Participant received WebRTC message:', data.type);
     
@@ -1069,32 +912,23 @@ function ParticipantRoom({ room, onLeave }) {
         if (data.question_index === 0) {
           return [data.question];
         }
-        return [...prev, data.question];
+        if (!prev.includes(data.question)) {
+          return [...prev, data.question];
+        }
+        return prev;
       });
       
       addMessage(data.question, 'ai_interviewer', new Date().toISOString());
       
       if (voiceEnabled && 'speechSynthesis' in window && interviewMode === "ai") {
-        playTTS(data.question);
+        speakQuestion(data.question);
       } else if (interviewMode === "ai") {
+        setAiInterviewerStatus("speaking");
         setTimeout(() => {
           setAiInterviewerStatus("listening");
           setIsListeningForResponse(true);
           addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-        }, 2000);
-      }
-    }
-    else if (data.type === 'chat' && data.message && data.message.includes('🤖 AI Question')) {
-      console.log('📝 Detected AI question in chat message');
-      const questionMatch = data.message.match(/🤖 AI Question \d+\/\d+: (.+)/);
-      if (questionMatch) {
-        const questionText = questionMatch[1];
-        setCurrentQuestion(questionText);
-        addMessage(questionText, 'ai_interviewer', new Date().toISOString());
-        
-        if (voiceEnabled) {
-          playTTS(questionText);
-        }
+        }, 3000);
       }
     }
     else if (data.type === 'screen_share_state') {
@@ -1120,13 +954,7 @@ function ParticipantRoom({ room, onLeave }) {
         addMessage(data.questions[0], 'ai_interviewer', new Date().toISOString());
         
         if (voiceEnabled && 'speechSynthesis' in window) {
-          playTTS(data.questions[0]);
-        } else {
-          setTimeout(() => {
-            setAiInterviewerStatus("listening");
-            setIsListeningForResponse(true);
-            addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-          }, 3000);
+          speakQuestion(data.questions[0]);
         }
       }
       
@@ -1175,11 +1003,123 @@ function ParticipantRoom({ room, onLeave }) {
           window.speechSynthesis.cancel();
         }
       }
-    } else if (data.type === 'resume_uploaded') {
-      console.log('📄 Resume upload notification from interviewer:', data.resume_text?.substring(0, 50));
-    } else if (data.type === 'resume_sync_complete') {
-      console.log('✅ Resume sync complete:', data.message);
-      addMessage(data.message || 'Resume synchronized with AI system', 'system', new Date().toISOString());
+    }
+  };
+
+  // Function to speak the question
+  const speakQuestion = (text) => {
+    if (!voiceEnabled || !text) return;
+    
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 0.95;
+      utterance.pitch = 1.0;
+      utterance.volume = 1.0;
+      utterance.lang = 'en-US';
+      
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length > 0) {
+        const preferredVoice = voices.find(voice => 
+          voice.lang.includes('en') && !voice.name.includes('Microsoft')
+        );
+        if (preferredVoice) {
+          utterance.voice = preferredVoice;
+        }
+      }
+      
+      utterance.onstart = () => {
+        console.log('🗣️ TTS started');
+        setAiInterviewerStatus("speaking");
+        setIsListeningForResponse(false);
+      };
+      
+      utterance.onend = () => {
+        console.log('🗣️ TTS finished');
+        setAiInterviewerStatus("listening");
+        setIsListeningForResponse(true);
+        addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
+      };
+      
+      utterance.onerror = (event) => {
+        console.error('TTS error:', event);
+        setAiInterviewerStatus("listening");
+        setIsListeningForResponse(true);
+      };
+      
+      window.speechSynthesis.speak(utterance);
+      console.log('🗣️ Playing TTS for AI question');
+    } else {
+      setAiInterviewerStatus("listening");
+      setIsListeningForResponse(true);
+      addMessage("👂 AI is waiting for your response. Please type your answer.", 'system', new Date().toISOString());
+    }
+  };
+
+  const initializeSpeechRecognition = () => {
+    if (!voiceEnabled) return;
+    
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const recognitionInstance = new SpeechRecognition();
+      recognitionInstance.continuous = false;
+      recognitionInstance.interimResults = true;
+      recognitionInstance.lang = 'en-US';
+      recognitionInstance.maxAlternatives = 1;
+      
+      recognitionInstance.onresult = (event) => {
+        let finalTranscript = '';
+        
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          if (event.results[i].isFinal) {
+            finalTranscript += event.results[i][0].transcript;
+          }
+        }
+        
+        if (finalTranscript) {
+          console.log('🎤 Speech recognized:', finalTranscript);
+          handleVoiceTranscript(finalTranscript);
+          recognitionInstance.stop();
+        }
+      };
+      
+      recognitionInstance.onerror = (event) => {
+        console.error('🎤 Speech recognition error:', event.error);
+      };
+      
+      setRecognition(recognitionInstance);
+    } else {
+      console.warn('🎤 Speech recognition not supported in this browser');
+      addMessage("⚠️ Voice input not fully supported. Please use the record button or type your responses.", 'system', new Date().toISOString());
+    }
+  };
+
+  const startListeningForResponse = () => {
+    if (aiInterviewerStatus !== "listening") {
+      console.log('Not listening because status is:', aiInterviewerStatus);
+      return;
+    }
+    
+    if (recognition) {
+      try {
+        recognition.start();
+        setIsListeningForResponse(true);
+        
+        const timeout = setTimeout(() => {
+          if (recognition) {
+            recognition.stop();
+          }
+          setIsListeningForResponse(false);
+          console.log('⏰ Response timeout reached');
+          addMessage("⏰ Response timeout. Please use the record button or type your response.", 'system', new Date().toISOString());
+        }, 45000);
+        
+        setResponseTimeout(timeout);
+        
+      } catch (error) {
+        console.error('🎤 Error starting speech recognition:', error);
+      }
     }
   };
 
@@ -1367,12 +1307,14 @@ function ParticipantRoom({ room, onLeave }) {
         }, 25000);
         
         if (currentSessionId) {
+          console.log('📝 Registering session with AI backend:', currentSessionId);
           ws.send(JSON.stringify({
-            type: 'command',
-            command: 'register_session',
+            type: 'register_session',
             session_id: currentSessionId,
             room_id: room.id
           }));
+        } else {
+          console.warn('⚠️ No session ID available for registration');
         }
         
         addMessage("🤖 AI analysis system connected", 'system', new Date().toISOString());
@@ -1423,7 +1365,7 @@ function ParticipantRoom({ room, onLeave }) {
               console.log('📝 Setting first question:', data.questions[0]);
               setCurrentQuestion(data.questions[0]);
               addMessage(data.questions[0], 'ai_interviewer', new Date().toISOString());
-              playTTS(data.questions[0]);
+              speakQuestion(data.questions[0]);
               setQuestionHistory([data.questions[0]]);
             }
           } else if (data.type === 'ai_answer_feedback') {
@@ -1444,7 +1386,7 @@ function ParticipantRoom({ room, onLeave }) {
               setTimeout(() => {
                 setCurrentQuestion(data.next_question);
                 addMessage(data.next_question, 'ai_interviewer', new Date().toISOString());
-                playTTS(data.next_question);
+                speakQuestion(data.next_question);
                 setQuestionHistory(prev => [...prev, data.next_question]);
               }, 2000);
             } else if (data.final_results) {
@@ -1465,7 +1407,7 @@ function ParticipantRoom({ room, onLeave }) {
             console.log('📝 New question from AI:', data.question);
             setCurrentQuestion(data.question);
             addMessage(data.question, 'ai_interviewer', new Date().toISOString());
-            playTTS(data.question);
+            speakQuestion(data.question);
             setQuestionHistory(prev => [...prev, data.question]);
           } else if (data.type === 'ai_interview_error') {
             console.error('❌ AI Interview Error:', data.message);
@@ -1569,6 +1511,13 @@ function ParticipantRoom({ room, onLeave }) {
     try {
       const video = videoRef.current;
       if (video.videoWidth === 0 || video.videoHeight === 0 || video.readyState !== 4) {
+        if (Math.random() < 0.01) {
+          console.log('🎥 Video not ready:', { 
+            width: video.videoWidth, 
+            height: video.videoHeight, 
+            readyState: video.readyState 
+          });
+        }
         return;
       }
       
@@ -1579,9 +1528,10 @@ function ParticipantRoom({ room, onLeave }) {
       canvas.height = video.videoHeight;
       
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const imageData = canvas.toDataURL('image/jpeg', 0.7);
       
-      if (wsRef.current.readyState === WebSocket.OPEN) {
+      const imageData = canvas.toDataURL('image/jpeg', 0.5);
+      
+      if (wsRef.current.readyState === WebSocket.OPEN && currentSessionId) {
         const frameData = {
           type: 'participant_frame',
           image: imageData,
@@ -1591,15 +1541,21 @@ function ParticipantRoom({ room, onLeave }) {
           sessionId: currentSessionId
         };
         wsRef.current.send(JSON.stringify(frameData));
-        console.log('🎥 Frame sent for detection at', new Date().toLocaleTimeString());
+        
+        setFrameCount(prev => prev + 1);
+        
+        if (frameCount % 50 === 0) {
+          console.log('🎥 Frame sent for detection at', new Date().toLocaleTimeString(), 'Session:', currentSessionId);
+        }
       }
     } catch (error) {
       console.error('❌ Error capturing participant frame:', error);
+      canvasRef.current = null;
     }
-  }, [videoRef, wsRef, isExplicitlyClosing, room.id, currentSessionId]);
+  }, [videoRef, wsRef, isExplicitlyClosing, room.id, currentSessionId, frameCount]);
 
   useEffect(() => {
-    if (isCameraOn && mediaStream && aiConnected && !isExplicitlyClosing) {
+    if (isCameraOn && mediaStream && aiConnected && !isExplicitlyClosing && currentSessionId) {
       console.log('🎥 Setting up video frame capture for detection (500ms interval)');
       
       if (frameIntervalRef.current) {
@@ -1617,7 +1573,7 @@ function ParticipantRoom({ room, onLeave }) {
         }
       };
     }
-  }, [isCameraOn, mediaStream, aiConnected, captureAndSendFrame]);
+  }, [isCameraOn, mediaStream, aiConnected, captureAndSendFrame, currentSessionId]);
 
   const checkConnectionHealth = useCallback(() => {
     if (!webrtcManagerRef.current || webrtcManagerRef.current.isClosed) return 'closed';
@@ -1686,8 +1642,14 @@ function ParticipantRoom({ room, onLeave }) {
         console.error('❌ WebRTC manager not initialized');
       }
       
-      connectWebSocket();
-      await createSession();
+      const sessionId = await createSession();
+      if (sessionId) {
+        console.log('✅ Session created:', sessionId);
+        connectWebSocket();
+      } else {
+        console.error('❌ Failed to create session');
+      }
+      
       initializeSpeechRecognition();
       
       console.log('✅ Camera started successfully');
@@ -1913,6 +1875,12 @@ function ParticipantRoom({ room, onLeave }) {
     addMessage("🛑 Stopped screen sharing", 'system', new Date().toISOString());
   };
 
+  const isParticipantVideoReady = () => {
+    if (!videoRef.current) return false;
+    const video = videoRef.current;
+    return video.videoWidth > 0 && video.videoHeight > 0 && video.readyState >= 2;
+  };
+
   const createSession = async () => {
     try {
       const user = JSON.parse(localStorage.getItem('interviewUser') || '{}');
@@ -1967,12 +1935,6 @@ function ParticipantRoom({ room, onLeave }) {
     } catch (error) {
       console.error('❌ Error saving participant detection:', error);
     }
-  };
-
-  const isParticipantVideoReady = () => {
-    if (!videoRef.current) return false;
-    const video = videoRef.current;
-    return video.videoWidth > 0 && video.videoHeight > 0 && video.readyState >= 2;
   };
 
   const toggleChat = () => {

@@ -64,8 +64,9 @@ function InterviewRoom({ room, onLeave }) {
   });
   const [connectionRetryCount, setConnectionRetryCount] = useState(0);
   const [isExplicitlyClosing, setIsExplicitlyClosing] = useState(false);
+  const [frameCount, setFrameCount] = useState(0);
 
-  // ✅ USE INTERVIEWER MODE FROM CONTEXT - FIXED
+  // ✅ USE INTERVIEWER MODE FROM CONTEXT
   const { 
     mode: interviewMode, 
     setMode: setInterviewMode, 
@@ -259,7 +260,7 @@ function InterviewRoom({ room, onLeave }) {
           formData.append('room_id', data.room_id || room.id);
           formData.append('resume_text', data.resume_text || 'Resume uploaded by participant');
           
-          fetch(`${PYTHON_API_URL}/manual_upload_resume`, {
+          fetch(`${PYTHON_API_URL}/upload_resume`, {
             method: "POST",
             body: formData,
           })
@@ -729,8 +730,7 @@ function InterviewRoom({ room, onLeave }) {
         // Register the session immediately
         if (currentSessionId) {
           const registerMsg = {
-            type: 'command',
-            command: 'register_session',
+            type: 'register_session',
             session_id: currentSessionId,
             room_id: room.id
           };
@@ -752,7 +752,7 @@ function InterviewRoom({ room, onLeave }) {
               }
             }, 10000);
           }
-        }, 25000); // Send ping every 25 seconds
+        }, 25000);
         
         setTimeout(() => {
           if (participantVideoRef.current && interviewStatus === "active" && !isExplicitlyClosing) {
@@ -864,8 +864,7 @@ function InterviewRoom({ room, onLeave }) {
         
         if (currentSessionId) {
           ws.send(JSON.stringify({
-            type: 'command',
-            command: 'register_session',
+            type: 'register_session',
             session_id: currentSessionId,
             room_id: room.id
           }));
@@ -888,7 +887,10 @@ function InterviewRoom({ room, onLeave }) {
             return;
           }
           
-          if (data.type === 'ai_interview_started') {
+          if (data.type === 'session_registered') {
+            console.log('✅ Session registered with AI interviewer');
+            setAiInterviewerStatus("connected");
+          } else if (data.type === 'interview_started') {
             console.log('🤖 AI interview started');
             addMessage("🤖 AI Interview started with participant", 'system', new Date().toISOString());
             
@@ -931,7 +933,7 @@ function InterviewRoom({ room, onLeave }) {
                 });
               }
             }
-          } else if (data.type === 'ai_answer_feedback') {
+          } else if (data.type === 'answer_result') {
             console.log('📊 AI answer feedback:', data);
             addMessage(`🤖 AI Score: ${data.score}/10 - ${data.feedback}`, 'system', new Date().toISOString());
             
@@ -978,7 +980,7 @@ function InterviewRoom({ room, onLeave }) {
               addMessage(`🎉 AI Interview Completed! Score: ${data.final_results.percentage}% - ${data.final_results.verdict}`, 'system', new Date().toISOString());
               setAiInterviewerStatus("complete");
             }
-          } else if (data.type === 'ai_interview_error') {
+          } else if (data.type === 'error') {
             console.error('❌ AI Interview Error:', data.message);
             addMessage(`❌ AI Error: ${data.message}`, 'system', new Date().toISOString());
             setAiInterviewerStatus("error");
@@ -1033,6 +1035,7 @@ function InterviewRoom({ room, onLeave }) {
     }
   };
 
+  // FIXED: Improved startResumeBasedAIInterview with proper JSON
   const startResumeBasedAIInterview = async () => {
     if (!resumeData || !currentSessionId) {
       alert("Resume not available or session not ready");
@@ -1046,30 +1049,49 @@ function InterviewRoom({ room, onLeave }) {
 
     try {
       console.log('🤖 Starting resume-based AI interview...');
+      console.log('📝 Session ID:', currentSessionId);
+      console.log('📝 Room ID:', room.id);
       
       setAiInterviewerActive(true);
       setAiInterviewerStatus("starting");
       
-      const response = await fetch(
-        `${PYTHON_API_URL}/start_ai_interview?session_id=${currentSessionId}&level=medium&room_id=${room.id}`,
-        { 
-          method: "POST",
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-          }
-        }
-      );
+      // Use POST with JSON body (not query params)
+      const response = await fetch(`${PYTHON_API_URL}/start_ai_interview`, {
+        method: "POST",
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          session_id: currentSessionId,
+          level: aiInterviewerConfig.difficulty || "medium",
+          room_id: room.id
+        })
+      });
       
       if (!response.ok) {
         const errorText = await response.text();
         console.error('❌ AI interview start failed:', errorText);
-        throw new Error(`HTTP ${response.status}: ${errorText}`);
+        
+        let errorMessage = `HTTP ${response.status}`;
+        try {
+          const errorData = JSON.parse(errorText);
+          errorMessage = errorData.message || errorText;
+        } catch {
+          errorMessage = errorText;
+        }
+        
+        throw new Error(errorMessage);
       }
       
       const result = await response.json();
       console.log('✅ AI Interview started:', result);
       
+      if (result.status === "error") {
+        throw new Error(result.message);
+      }
+      
+      // Connect to AI WebSocket
       connectToAIInterviewer();
       
       if (result.questions && result.questions.length > 0) {
@@ -1104,9 +1126,11 @@ function InterviewRoom({ room, onLeave }) {
           }, 3000);
         }
         
+        // Send AI question to participant via WebRTC chat
         if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
           console.log('📤 Sending AI question to participant via WebRTC');
-          webrtcManagerRef.current.sendData('chat', {
+          
+          const messageSent = webrtcManagerRef.current.sendData('chat', {
             type: 'ai_question',
             question: firstQuestion,
             question_index: 0,
@@ -1116,18 +1140,26 @@ function InterviewRoom({ room, onLeave }) {
             room_id: room.id,
             message: 'AI Interview starting now'
           });
-        }
-        
-        if (webrtcManagerRef.current) {
-          webrtcManagerRef.current.sendChatMessage(
-            `🤖 AI Question 1/5: ${firstQuestion}`,
-            `aiq-${Date.now()}`
-          );
+          
+          if (!messageSent) {
+            console.warn('⚠️ Failed to send AI question via data channel, trying chat message fallback');
+            webrtcManagerRef.current.sendChatMessage(
+              `🤖 AI Question 1/${result.questions.length}: ${firstQuestion}`,
+              `aiq-${Date.now()}`
+            );
+          }
+        } else {
+          console.warn('⚠️ Chat data channel not open, sending question as fallback');
+          if (webrtcManagerRef.current) {
+            webrtcManagerRef.current.sendChatMessage(
+              `🤖 AI Question 1/${result.questions.length}: ${firstQuestion}`,
+              `aiq-${Date.now()}`
+            );
+          }
         }
       }
       
       addMessage("🤖 AI Interview started based on participant's resume!", 'system', new Date().toISOString());
-      
       alert("✅ AI interview started! Participant will now receive AI questions.");
       
     } catch (error) {
@@ -1169,8 +1201,10 @@ function InterviewRoom({ room, onLeave }) {
     }
     
     if (currentSessionId) {
-      fetch(`${PYTHON_API_URL}/end_ai_interview?session_id=${currentSessionId}`, {
+      fetch(`${PYTHON_API_URL}/end_ai_interview`, {
         method: "POST",
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: currentSessionId })
       })
       .catch(error => {
         console.error('❌ Error ending AI interview on backend:', error);
@@ -1633,6 +1667,7 @@ function InterviewRoom({ room, onLeave }) {
     }
   };
 
+  // FIXED: Improved frame capture with better error handling
   const captureAndSendFrame = () => {
     if (!participantVideoRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       return;
@@ -1659,19 +1694,26 @@ function InterviewRoom({ room, onLeave }) {
       
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       
-      const imageData = canvas.toDataURL('image/jpeg', 0.8);
+      const imageData = canvas.toDataURL('image/jpeg', 0.7);
       
-      const frameData = {
-        type: 'participant_frame',
-        image: imageData,
-        timestamp: Date.now(),
-        roomId: room.id,
-        sessionId: currentSessionId,
-        userId: 'interviewer'
-      };
-      
-      wsRef.current.send(JSON.stringify(frameData));
-      
+      if (wsRef.current.readyState === WebSocket.OPEN && currentSessionId) {
+        const frameData = {
+          type: 'participant_frame',
+          image: imageData,
+          timestamp: Date.now(),
+          roomId: room.id,
+          sessionId: currentSessionId,
+          userId: 'interviewer'
+        };
+        wsRef.current.send(JSON.stringify(frameData));
+        
+        setFrameCount(prev => prev + 1);
+        
+        // Log every 50 frames
+        if (frameCount % 50 === 0) {
+          console.log('🎥 Frame sent for detection');
+        }
+      }
     } catch (error) {
       console.error('❌ Error capturing frame:', error);
       canvasRef.current = null;
@@ -2249,6 +2291,17 @@ function InterviewRoom({ room, onLeave }) {
         </span>
         {resumeData?.manualMode && <span className="manual-mode-indicator">👤</span>}
       </button>
+      
+      {!resumeData && interviewMode === "ai" && interviewStatus === "active" && (
+        <button 
+          className="start-ai-from-resume-button"
+          onClick={() => alert("Please ask the participant to upload their resume first")}
+          title="Resume required for AI interview"
+        >
+          <span className="ai-icon">🤖</span>
+          <span className="ai-text">Need Resume</span>
+        </button>
+      )}
     </div>
   );
 
@@ -2330,10 +2383,9 @@ function InterviewRoom({ room, onLeave }) {
           <div className="video-container">
             <div className={`video-grid ${isScreenSharing || isParticipantScreenSharing ? 'has-screen-share' : ''}`}>
               
-              {/* INTERVIEWER VIDEO TILE - FIXED: Removed AIInterviewQA component */}
+              {/* INTERVIEWER VIDEO TILE */}
               <div className={`video-tile interviewer-tile ${isScreenSharing ? 'screen-share' : ''} ${interviewMode === 'ai' && aiInterviewerActive ? 'ai-agent-active' : ''}`}>
                 {interviewMode === 'ai' && aiInterviewerActive ? (
-                  // INTERVIEWER VIEW - Shows AI status panel (NO voice recorder or answer input)
                   <div className="ai-interviewer-status-panel">
                     <div className="ai-status-header">
                       <span className="ai-icon-large">🤖</span>
