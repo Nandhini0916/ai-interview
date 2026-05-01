@@ -28,9 +28,9 @@ export class WebRTCSignaling {
     
     this.config = {
       reconnectAttempts: 0,
-      maxReconnectAttempts: 3,
+      maxReconnectAttempts: 5,
       baseReconnectDelay: 2000,
-      maxReconnectDelay: 15000,
+      maxReconnectDelay: 30000,
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
@@ -51,6 +51,9 @@ export class WebRTCSignaling {
     this.isReconnecting = false;
     this.isClosed = false;
     this.heartbeatInterval = null;
+    this.pongTimeout = null;
+    this.missedHeartbeats = 0;
+    this.maxMissedHeartbeats = 3;
     this.lastHeartbeat = 0;
     this.iceGatheringComplete = false;
     this.pendingIceCandidates = [];
@@ -97,6 +100,7 @@ export class WebRTCSignaling {
           this.isConnected = true;
           this.isConnecting = false;
           this.config.reconnectAttempts = 0;
+          this.missedHeartbeats = 0;
           
           this.startHeartbeat();
           this.sendJoinMessage();
@@ -108,6 +112,18 @@ export class WebRTCSignaling {
         this.ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
+            
+            // Handle pong to reset heartbeat counter
+            if (data.type === 'pong') {
+              this.missedHeartbeats = 0;
+              if (this.pongTimeout) {
+                clearTimeout(this.pongTimeout);
+                this.pongTimeout = null;
+              }
+              console.log(`📡 ${this.role} received pong`);
+              return;
+            }
+            
             console.log(`📨 ${this.role} received:`, data.type);
             this.handleSignalingMessage(data);
           } catch (error) {
@@ -155,19 +171,38 @@ export class WebRTCSignaling {
     this.heartbeatInterval = setInterval(() => {
       if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
         try {
-          this.sendSignalingMessage({ type: 'ping', timestamp: Date.now() });
-          this.lastHeartbeat = Date.now();
+          const pingId = Date.now();
+          this.sendSignalingMessage({ type: 'ping', timestamp: pingId, id: pingId });
+          this.lastHeartbeat = pingId;
+          
+          // Set timeout to check for pong
+          if (this.pongTimeout) clearTimeout(this.pongTimeout);
+          this.pongTimeout = setTimeout(() => {
+            this.missedHeartbeats++;
+            console.warn(`⚠️ ${this.role} missed heartbeat ${this.missedHeartbeats}/${this.maxMissedHeartbeats}`);
+            
+            if (this.missedHeartbeats >= this.maxMissedHeartbeats) {
+              console.error(`❌ ${this.role} max missed heartbeats reached, reconnecting...`);
+              this.isConnected = false;
+              this.ws?.close();
+              this.missedHeartbeats = 0;
+            }
+          }, 10000);
         } catch (err) {
           console.warn('⚠️ Failed to send ping:', err);
         }
       }
-    }, 30000);
+    }, 25000);
   }
   
   stopHeartbeat() {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
+    }
+    if (this.pongTimeout) {
+      clearTimeout(this.pongTimeout);
+      this.pongTimeout = null;
     }
   }
   
@@ -187,7 +222,7 @@ export class WebRTCSignaling {
   handleSignalingMessage(data) {
     try {
       if (data.type === 'ping') {
-        this.sendSignalingMessage({ type: 'pong', timestamp: Date.now() });
+        this.sendSignalingMessage({ type: 'pong', timestamp: Date.now(), id: data.id });
         return;
       }
       
@@ -869,7 +904,7 @@ export class WebRTCSignaling {
       this.config.maxReconnectDelay
     );
     
-    console.log(`🔄 Attempting reconnect in ${delay}ms (attempt ${this.config.reconnectAttempts})`);
+    console.log(`🔄 Attempting reconnect in ${delay}ms (attempt ${this.config.reconnectAttempts}/${this.config.maxReconnectAttempts})`);
     
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);

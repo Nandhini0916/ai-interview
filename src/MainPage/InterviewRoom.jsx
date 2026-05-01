@@ -333,6 +333,75 @@ function InterviewRoom({ room, onLeave }) {
         }
         break;
         
+      // ADD THIS CASE - Handle answer submissions from participant
+      case 'answer_submission':
+        console.log('📝 Received answer from participant via WebRTC:', {
+          question: data.question?.substring(0, 50),
+          answer: data.answer?.substring(0, 50),
+          session_id: data.session_id
+        });
+        
+        // Forward the answer to Python backend
+        if (currentSessionId && aiInterviewerActive) {
+          fetch(`${PYTHON_API_URL}/submit_ai_answer`, {
+            method: "POST",
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              session_id: data.session_id || currentSessionId,
+              question: data.question,
+              answer: data.answer
+            })
+          })
+          .then(response => response.json())
+          .then(result => {
+            console.log('✅ Answer processed by backend:', result);
+            
+            // Add to chat for visibility
+            addMessage(`📊 Participant answer score: ${result.score}/10`, 'system', new Date().toISOString());
+            
+            // Forward result back to participant
+            if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+              webrtcManagerRef.current.sendData('chat', {
+                type: 'answer_result',
+                score: result.score,
+                feedback: result.feedback,
+                next_question: result.next_question,
+                is_complete: result.is_complete,
+                final_results: result.final_results,
+                timestamp: new Date().toISOString()
+              });
+            }
+            
+            // Update local state
+            if (result.next_question) {
+              setCurrentQuestion(result.next_question);
+              setQuestionHistory(prev => [...prev, result.next_question]);
+              addMessage(result.next_question, 'ai_interviewer', new Date().toISOString());
+              
+              // Play TTS for next question
+              if (aiInterviewerConfig.enableVoiceQuestions && 'speechSynthesis' in window) {
+                const utterance = new SpeechSynthesisUtterance(result.next_question);
+                utterance.rate = 0.95;
+                utterance.onstart = () => setAiInterviewerStatus("speaking");
+                utterance.onend = () => setAiInterviewerStatus("listening");
+                window.speechSynthesis.speak(utterance);
+              } else {
+                setAiInterviewerStatus("listening");
+              }
+            }
+            
+            if (result.is_complete) {
+              setAiInterviewerStatus("complete");
+              addMessage(`🎉 AI Interview Completed! Final Score: ${result.final_results?.percentage || 'N/A'}%`, 'system', new Date().toISOString());
+            }
+          })
+          .catch(error => {
+            console.error('❌ Failed to process answer:', error);
+            addMessage("❌ Failed to process participant's answer", 'system', new Date().toISOString());
+          });
+        }
+        break;
+        
       case 'resume_sync_complete':
         console.log('✅ Resume sync complete notification:', data.message);
         addMessage(data.message || 'Resume synchronized', 'system', new Date().toISOString());

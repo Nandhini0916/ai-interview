@@ -262,9 +262,6 @@ function ParticipantAIInterviewQA({
         if (onVoiceTranscript) {
           onVoiceTranscript(transcribedText);
         }
-        
-        // Auto-submit after successful transcription (optional)
-        // setTimeout(() => handleSubmit(), 500);
       } else {
         setTranscriptionError(result.error || 'Failed to transcribe audio');
       }
@@ -306,6 +303,15 @@ function ParticipantAIInterviewQA({
     const now = Date.now();
     
     console.log('📤 Submit called - checking conditions');
+    console.log('📤 Current state:', {
+      disabled,
+      aiInterviewerStatus,
+      hasAnswer: !!answer?.trim(),
+      isResponding,
+      localResponding,
+      isSubmitting,
+      answerSubmitted
+    });
     
     // Prevent double submission within 3 seconds
     if (now - lastSubmitTime < 3000) {
@@ -333,6 +339,7 @@ function ParticipantAIInterviewQA({
       return;
     }
     
+    // Check if AI is listening
     if (aiInterviewerStatus !== 'listening') {
       const statusMessages = {
         'speaking': 'Please wait for AI to finish speaking before submitting.',
@@ -345,11 +352,13 @@ function ParticipantAIInterviewQA({
       return;
     }
     
+    // Check if answer is not empty
     if (!answer?.trim()) {
       alert("Please enter or record your answer before submitting.");
       return;
     }
     
+    // Check if not already responding
     if (isResponding || localResponding) {
       console.log('⚠️ Submit blocked: Already responding');
       alert("Your answer is already being submitted. Please wait.");
@@ -375,6 +384,11 @@ function ParticipantAIInterviewQA({
     // Call the onSubmit prop from parent
     try {
       onSubmit();
+      
+      // Emit a custom event for debugging
+      window.dispatchEvent(new CustomEvent('answer-submitted', {
+        detail: { answer: answer, timestamp: Date.now() }
+      }));
     } catch (error) {
       console.error('❌ Error in onSubmit:', error);
       setAnswerSubmitted(false);
@@ -385,8 +399,11 @@ function ParticipantAIInterviewQA({
     
     // Reset local responding after a delay (fallback in case parent doesn't reset)
     submitTimeoutRef.current = setTimeout(() => {
-      setLocalResponding(false);
-      setIsSubmitting(false);
+      if (localResponding || isSubmitting) {
+        console.log('⚠️ Submit timeout - resetting state');
+        setLocalResponding(false);
+        setIsSubmitting(false);
+      }
     }, 15000);
   };
   
