@@ -341,25 +341,44 @@ function InterviewRoom({ room, onLeave }) {
           session_id: data.session_id
         });
         
+        // Add to chat so interviewer can see it
+        addMessage(data.answer, 'participant', data.timestamp || new Date().toISOString());
+        addMessage("🤖 AI is analyzing response...", 'system', new Date().toISOString());
+        
         // Forward the answer to Python backend
         if (currentSessionId && aiInterviewerActive) {
+          console.log('📤 Submitting participant answer to Python backend...');
+          
           fetch(`${PYTHON_API_URL}/submit_ai_answer`, {
             method: "POST",
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
             body: JSON.stringify({
               session_id: data.session_id || currentSessionId,
               question: data.question,
-              answer: data.answer
-            })
+              answer: data.answer,
+              room_id: room.id
+            }),
+            signal: AbortSignal.timeout(30000) // 30 second timeout
           })
-          .then(response => response.json())
+          .then(async response => {
+            if (!response.ok) {
+              const errorText = await response.text();
+              throw new Error(`HTTP ${response.status}: ${errorText}`);
+            }
+            return response.json();
+          })
           .then(result => {
             console.log('✅ Answer processed by backend:', result);
             
             // Add to chat for visibility
-            addMessage(`📊 Participant answer score: ${result.score}/10`, 'system', new Date().toISOString());
+            if (result.score !== undefined) {
+              addMessage(`📊 Participant score: ${result.score}/10`, 'system', new Date().toISOString());
+            }
             
-            // Forward result back to participant
+            // Forward result back to participant via WebRTC
             if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
               webrtcManagerRef.current.sendData('chat', {
                 type: 'answer_result',
@@ -370,35 +389,42 @@ function InterviewRoom({ room, onLeave }) {
                 final_results: result.final_results,
                 timestamp: new Date().toISOString()
               });
+              console.log('📤 Sent answer result to participant via WebRTC');
             }
             
-            // Update local state
+            // Update interviewer's local state
             if (result.next_question) {
               setCurrentQuestion(result.next_question);
               setQuestionHistory(prev => [...prev, result.next_question]);
               addMessage(result.next_question, 'ai_interviewer', new Date().toISOString());
               
-              // Play TTS for next question
-              if (aiInterviewerConfig.enableVoiceQuestions && 'speechSynthesis' in window) {
-                const utterance = new SpeechSynthesisUtterance(result.next_question);
-                utterance.rate = 0.95;
-                utterance.onstart = () => setAiInterviewerStatus("speaking");
-                utterance.onend = () => setAiInterviewerStatus("listening");
-                window.speechSynthesis.speak(utterance);
-              } else {
-                setAiInterviewerStatus("listening");
+              // Play TTS for interviewer too if enabled
+              if (aiInterviewerConfig.enableVoiceQuestions) {
+                playTTSAudio(result.next_question);
               }
             }
             
             if (result.is_complete) {
               setAiInterviewerStatus("complete");
-              addMessage(`🎉 AI Interview Completed! Final Score: ${result.final_results?.percentage || 'N/A'}%`, 'system', new Date().toISOString());
+              addMessage(`🎉 AI Interview Completed!`, 'system', new Date().toISOString());
             }
           })
           .catch(error => {
             console.error('❌ Failed to process answer:', error);
-            addMessage("❌ Failed to process participant's answer", 'system', new Date().toISOString());
+            addMessage(`❌ AI Error: ${error.message}`, 'system', new Date().toISOString());
+            
+            // Notify participant of the failure so they can retry
+            if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+              webrtcManagerRef.current.sendData('chat', {
+                type: 'answer_error',
+                message: 'AI backend failed to process your answer. Please try submitting again.',
+                timestamp: new Date().toISOString()
+              });
+            }
           });
+        } else {
+          console.warn('⚠️ Cannot submit answer: Session ID missing or AI not active');
+          addMessage("⚠️ Cannot process answer: AI session not active", 'system', new Date().toISOString());
         }
         break;
         
@@ -563,10 +589,11 @@ function InterviewRoom({ room, onLeave }) {
     
     if (newMode === "ai") {
       if (interviewStatus === "active") {
-        setAiInterviewerActive(true);
+        // Don't automatically set active. Let the config modal or manual start handle it.
+        // setAiInterviewerActive(true);
         
         addMessage(
-          "🤖 AI Interviewer activated. Click 'Start AI Interview' to begin.", 
+          "🤖 AI Interviewer mode ready. Please ensure participant has uploaded their resume, then click 'Start AI Interview' to begin.", 
           'system', 
           new Date().toISOString()
         );
@@ -2080,7 +2107,22 @@ function InterviewRoom({ room, onLeave }) {
   const handleAIConfigSubmit = () => {
     console.log("AI Interviewer Configuration Saved:", aiInterviewerConfig);
     setShowAIConfigModal(false);
-    alert("AI Interviewer configuration saved!");
+    
+    // Automatically start the AI interview if we have resume data
+    if (resumeData) {
+      startResumeBasedAIInterview();
+    } else {
+      alert("Configuration saved! AI Interview will start once the participant uploads their resume.");
+      
+      // Notify participant that we are ready and waiting for resume
+      if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+        webrtcManagerRef.current.sendData('chat', {
+          type: 'ai_interviewer_ready',
+          timestamp: new Date().toISOString(),
+          message: 'Interviewer is ready. Please upload your resume to start.'
+        });
+      }
+    }
   };
 
   useEffect(() => {

@@ -78,11 +78,23 @@ function ParticipantAIInterviewQA({
   // Reset local responding when isResponding changes from true to false
   useEffect(() => {
     if (!isResponding && localResponding) {
+      console.log('🔄 isResponding turned false - resetting local state');
       setLocalResponding(false);
       setAnswerSubmitted(false);
       setIsSubmitting(false);
     }
   }, [isResponding, localResponding]);
+  
+  // Safety reset when AI transitions to a ready state
+  useEffect(() => {
+    const readyStatuses = ['listening', 'idle', 'connected', 'speaking'];
+    if (readyStatuses.includes(aiInterviewerStatus) && !isResponding) {
+      console.log('👂 AI status is ready - ensuring inputs are enabled');
+      setAnswerSubmitted(false);
+      setIsSubmitting(false);
+      setLocalResponding(false);
+    }
+  }, [aiInterviewerStatus, isResponding]);
   
 
   
@@ -111,19 +123,25 @@ function ParticipantAIInterviewQA({
   
   // Start voice recording
   const startRecording = async () => {
-    if (disabled || aiInterviewerStatus !== 'listening' || answerSubmitted || isSubmitting) {
-      const statusMessages = {
-        'speaking': 'Please wait for AI to finish speaking before recording.',
-        'analyzing': 'AI is analyzing your previous answer. Please wait.',
-        'idle': 'AI Interviewer is not active. Please wait for a question.',
-        'complete': 'Interview is complete. Thank you for participating!',
-        'connected': 'AI is preparing your first question. Please wait...'
-      };
-      alert(statusMessages[aiInterviewerStatus] || `AI is currently ${aiInterviewerStatus}. Please wait.`);
-      return;
+    const readyStatuses = ['listening', 'idle', 'connected', 'speaking'];
+    if (disabled || !readyStatuses.includes(aiInterviewerStatus) || answerSubmitted || isSubmitting) {
+      if (aiInterviewerStatus === 'analyzing') {
+        alert('AI is analyzing your previous answer. Please wait.');
+        return;
+      }
+      if (aiInterviewerStatus === 'complete') {
+        alert('Interview is complete. Thank you for participating!');
+        return;
+      }
+      // If idle/connected/speaking but we have a question, allow it
+      if (!question && aiInterviewerStatus === 'idle') {
+        alert('AI Interviewer is not active. Please wait for a question.');
+        return;
+      }
     }
     
     setTranscriptionError(null);
+    setRecordingTime(0);
     
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -190,7 +208,8 @@ function ParticipantAIInterviewQA({
       
       const response = await fetch('http://localhost:8001/voice/transcribe', {
         method: 'POST',
-        body: formData
+        body: formData,
+        signal: AbortSignal.timeout(15000) // 15 second timeout
       });
       
       const result = await response.json();
@@ -284,16 +303,20 @@ function ParticipantAIInterviewQA({
       return;
     }
     
-    // Check if AI is listening
-    if (aiInterviewerStatus !== 'listening') {
+    // Check if AI is ready (listening, speaking, idle, or connected)
+    const readyStatuses = ['listening', 'idle', 'connected', 'speaking'];
+    if (!readyStatuses.includes(aiInterviewerStatus)) {
       const statusMessages = {
-        'speaking': 'Please wait for AI to finish speaking before submitting.',
         'analyzing': 'AI is analyzing your previous answer. Please wait.',
-        'idle': 'AI Interviewer is not active. Please wait for a question.',
-        'complete': 'Interview is complete. Thank you for participating!',
-        'connected': 'AI is preparing your first question. Please wait...'
+        'complete': 'Interview is complete. Thank you for participating!'
       };
       alert(statusMessages[aiInterviewerStatus] || `AI is currently ${aiInterviewerStatus}. Please wait.`);
+      return;
+    }
+    
+    // Safety check for idle state
+    if (aiInterviewerStatus === 'idle' && !question) {
+      alert("AI Interviewer is not active. Please wait for a question.");
       return;
     }
     
@@ -391,21 +414,28 @@ function ParticipantAIInterviewQA({
   
   // Determine if submit button should be disabled
   const isSubmitDisabled = disabled || 
-    aiInterviewerStatus !== 'listening' || 
+    (aiInterviewerStatus !== 'listening' && aiInterviewerStatus !== 'idle' && aiInterviewerStatus !== 'connected' && aiInterviewerStatus !== 'speaking') || 
     !answer?.trim() || 
     isResponding || 
-    localResponding ||
-    answerSubmitted ||
     isSubmitting;
   
   // Determine if textarea should be disabled
-  const isTextareaDisabled = aiInterviewerStatus !== 'listening' || disabled || isResponding || answerSubmitted || isSubmitting;
+  const isTextareaDisabled = disabled || 
+    (aiInterviewerStatus !== 'listening' && aiInterviewerStatus !== 'idle' && aiInterviewerStatus !== 'connected' && aiInterviewerStatus !== 'speaking') || 
+    isResponding || 
+    isSubmitting;
   
   // Determine if voice recording should be disabled
-  const isVoiceDisabled = disabled || aiInterviewerStatus !== 'listening' || isResponding || localResponding || answerSubmitted || isSubmitting;
+  const isVoiceDisabled = disabled || 
+    (aiInterviewerStatus !== 'listening' && aiInterviewerStatus !== 'idle' && aiInterviewerStatus !== 'connected') || 
+    isResponding || 
+    isSubmitting;
   
-  // Determine if textarea is enabled
-  const isTextareaEnabled = aiInterviewerStatus === 'listening' && !isResponding && !disabled && !answerSubmitted && !isSubmitting;
+  // Determine if textarea is enabled - more permissive for better UX
+  const isTextareaEnabled = !disabled && 
+    (aiInterviewerStatus === 'listening' || aiInterviewerStatus === 'idle' || aiInterviewerStatus === 'connected' || aiInterviewerStatus === 'speaking') && 
+    !isResponding && 
+    !isSubmitting;
   
   // Get appropriate placeholder text
   const getPlaceholderText = () => {
@@ -555,7 +585,7 @@ function ParticipantAIInterviewQA({
                 type="button"
                 onClick={startRecording}
                 disabled={isVoiceDisabled || isTranscribing}
-                className={`voice-record-button ${aiInterviewerStatus === 'listening' && !isResponding && !localResponding && !answerSubmitted && !isSubmitting ? 'ready' : ''}`}
+                className={`voice-record-button ${aiInterviewerStatus === 'listening' && !isResponding && !isSubmitting ? 'ready' : ''}`}
                 style={{
                   opacity: (isVoiceDisabled || isTranscribing) ? 0.5 : 1,
                   cursor: (isVoiceDisabled || isTranscribing) ? 'not-allowed' : 'pointer'
@@ -578,9 +608,15 @@ function ParticipantAIInterviewQA({
             {transcriptionError && (
               <div className="transcription-error">
                 ⚠️ {transcriptionError}
+                <button 
+                  onClick={() => setTranscriptionError(null)} 
+                  style={{ marginLeft: '10px', background: 'none', border: 'none', color: '#ffeb3b', cursor: 'pointer', textDecoration: 'underline', fontSize: '10px' }}
+                >
+                  Clear
+                </button>
               </div>
             )}
-            {voiceEnabled && aiInterviewerStatus === 'listening' && !isRecording && !isTranscribing && !isResponding && !localResponding && !answerSubmitted && !isSubmitting && (
+            {voiceEnabled && aiInterviewerStatus === 'listening' && !isRecording && !isTranscribing && !isResponding && !isSubmitting && (
               <div className="voice-hint">
                 💡 Click the microphone to record your answer, or type below
               </div>

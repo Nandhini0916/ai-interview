@@ -107,6 +107,8 @@ function ParticipantRoom({ room, onLeave }) {
   const reconnectAttemptsRef = useRef(0);
   const maxReconnectAttempts = 5;
   const reconnectDelay = 3000;
+  const utteranceRef = useRef(null);
+  const analysisTimeoutRef = useRef(null);
 
   const PYTHON_API_URL = 'http://localhost:8001';
   const NODE_API_URL = 'http://localhost:8000/api';
@@ -351,10 +353,18 @@ function ParticipantRoom({ room, onLeave }) {
       return;
     }
     
-    if (!aiInterviewerActive) {
+    // If in AI mode, we should allow submission if a question is present, 
+    // even if the "active" flag isn't set (e.g. sync issue)
+    if (!aiInterviewerActive && interviewMode !== "ai") {
       console.warn('⚠️ Cannot submit - AI Interviewer not active');
       addMessage("⚠️ AI Interviewer is not active. Please wait for the interviewer to start the AI session.", 'system', new Date().toISOString());
       return;
+    }
+    
+    // Ensure we have a session ID
+    const sessionId = currentSessionId || `session-${Date.now()}`;
+    if (!currentSessionId) {
+      setCurrentSessionId(sessionId);
     }
     
     if (!currentQuestion) {
@@ -363,15 +373,21 @@ function ParticipantRoom({ room, onLeave }) {
       return;
     }
     
-    if (aiInterviewerStatus !== "listening") {
+    const readyStatuses = ['listening', 'idle', 'connected', 'speaking'];
+    if (!readyStatuses.includes(aiInterviewerStatus)) {
       const statusMessages = {
-        'speaking': 'Please wait for AI to finish speaking before submitting.',
         'analyzing': 'AI is analyzing your previous answer. Please wait.',
         'idle': 'AI Interviewer is not active. Please wait for a question.',
         'complete': 'Interview is complete. Thank you for participating!',
         'connected': 'AI is preparing your first question. Please wait...'
       };
       addMessage(`⚠️ ${statusMessages[aiInterviewerStatus] || `AI is currently ${aiInterviewerStatus}. Please wait.`}`, 'system', new Date().toISOString());
+      return;
+    }
+    
+    // Safety check for idle state
+    if (aiInterviewerStatus === 'idle' && !currentQuestion) {
+      addMessage("⚠️ AI Interviewer is not active. Please wait for a question.", 'system', new Date().toISOString());
       return;
     }
     
@@ -412,83 +428,62 @@ function ParticipantRoom({ room, onLeave }) {
       setAiInterviewerStatus("analyzing");
       addMessage("🤖 AI is analyzing your response...", 'system', new Date().toISOString());
       
-      // Submit via REST API
-      const submitResponse = await fetch(`${PYTHON_API_URL}/submit_ai_answer`, {
-        method: "POST",
-        headers: { 
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-          session_id: currentSessionId,
-          question: currentQuestion,
-          answer: trimmedResponse
-        })
-      });
+      // Safety timeout: Reset status if analysis takes > 45 seconds
+      if (analysisTimeoutRef.current) clearTimeout(analysisTimeoutRef.current);
+      analysisTimeoutRef.current = setTimeout(() => {
+        if (aiInterviewerStatus === "analyzing") {
+          console.warn('⚠️ Analysis timeout - resetting status');
+          setAiInterviewerStatus("listening");
+          addMessage("⚠️ AI analysis is taking longer than expected. You can try re-submitting or waiting a bit longer.", 'system', new Date().toISOString());
+        }
+      }, 45000);
       
-      if (!submitResponse.ok) {
-        const errorText = await submitResponse.text();
-        console.error('❌ API submission failed:', errorText);
+      // Notify interviewer via WebRTC
+      if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
+        webrtcManagerRef.current.sendData('chat', {
+          type: 'answer_submission',
+          question: currentQuestion,
+          answer: trimmedResponse,
+          session_id: currentSessionId,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+      // Submit via REST API only if WebRTC is not available (Interviewer room disconnected)
+      if (!webrtcManagerRef.current || !webrtcManagerRef.current.isDataChannelOpen('chat')) {
+        console.log('📡 No WebRTC connection, submitting via REST API fallback');
+        const submitResponse = await fetch(`${PYTHON_API_URL}/submit_ai_answer`, {
+          method: "POST",
+          headers: { 
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({
+            session_id: currentSessionId,
+            question: currentQuestion,
+            answer: trimmedResponse
+          }),
+          signal: AbortSignal.timeout(30000)
+        });
         
-        let errorMessage = `HTTP ${submitResponse.status}`;
-        try {
-          const errorData = JSON.parse(errorText);
-          errorMessage = errorData.message || errorData.error || errorText;
-        } catch {
-          errorMessage = errorText || submitResponse.statusText;
+        if (!submitResponse.ok) {
+          throw new Error(`HTTP ${submitResponse.status}`);
         }
         
-        throw new Error(errorMessage.substring(0, 200));
-      }
-      
-      const result = await submitResponse.json();
-      console.log('✅ Answer submitted, result:', result);
-      
-      // Show feedback score
-      if (result.score !== undefined) {
-        const feedbackMessage = `📊 Score: ${result.score}/10 - ${result.feedback || 'Good response!'}`;
-        setResponseAnalysis({ score: result.score, feedback: result.feedback });
-        addMessage(feedbackMessage, 'system', new Date().toISOString());
-      }
-      
-      // Handle next question or completion
-      if (result.next_question) {
-        console.log('📝 Next question received:', result.next_question);
-        
-        setTimeout(() => {
+        const result = await submitResponse.json();
+        // Handle result locally if we did the fetch
+        if (result.next_question) {
           setCurrentQuestion(result.next_question);
           addMessage(result.next_question, 'ai_interviewer', new Date().toISOString());
           setQuestionHistory(prev => [...prev, result.next_question]);
-          
-          // Use unified robust speakQuestion function
           speakQuestion(result.next_question);
-        }, 1000);
-      } else if (result.is_complete || result.final_results) {
-        console.log('🎉 Interview completed!');
-        setAiInterviewerStatus("complete");
-        setIsListeningForResponse(false);
-        
-        const finalMessage = `🎉 AI Interview Completed! Final Score: ${result.final_results?.percentage || result.percentage || 'N/A'}%`;
-        addMessage(finalMessage, 'system', new Date().toISOString());
-        
-        setTimeout(() => {
-          setCurrentQuestion("");
-          setAiInterviewerActive(false);
-          setAiInterviewerStatus("idle");
-        }, 5000);
-        
+        }
       } else {
-        console.warn('⚠️ No next question provided, requesting...');
-        addMessage("🔄 Loading next question...", 'system', new Date().toISOString());
-        
-        setTimeout(() => {
-          if (aiInterviewerActive) {
-            requestAIQuestion();
-            setAiInterviewerStatus("listening");
-            setIsListeningForResponse(true);
-          }
-        }, 2000);
+        console.log('✅ Answer sent via WebRTC, waiting for interviewer to process...');
       }
+      
+      // Clear response text immediately
+      setResponseText("");
       
     } catch (error) {
       console.error('❌ Error handling candidate response:', error);
@@ -585,15 +580,52 @@ function ParticipantRoom({ room, onLeave }) {
       addMessage(data.question, 'ai_interviewer', new Date().toISOString());
       
       if (interviewMode === "ai") {
+        setAiInterviewerStatus("listening"); // Set to listening immediately as backup
         speakQuestion(data.question);
       }
+    }
+    else if (data.type === 'answer_result') {
+      console.log('📊 Received answer result via WebRTC:', data);
+      
+      // Clear analysis timeout
+      if (analysisTimeoutRef.current) {
+        clearTimeout(analysisTimeoutRef.current);
+        analysisTimeoutRef.current = null;
+      }
+      
+      if (data.score !== undefined) {
+        const feedbackMessage = `📊 Score: ${data.score}/10 - ${data.feedback || 'Good response!'}`;
+        setResponseAnalysis({ score: data.score, feedback: data.feedback });
+        addMessage(feedbackMessage, 'system', new Date().toISOString());
+      }
+      
+      if (data.next_question) {
+        setTimeout(() => {
+          setCurrentQuestion(data.next_question);
+          addMessage(data.next_question, 'ai_interviewer', new Date().toISOString());
+          setQuestionHistory(prev => [...prev, data.next_question]);
+          speakQuestion(data.next_question);
+        }, 1000);
+      } else if (data.is_complete) {
+        setAiInterviewerStatus("complete");
+        addMessage(`🎉 Interview Completed! Final Score: ${data.final_results?.percentage || 'N/A'}%`, 'system', new Date().toISOString());
+      }
+    }
+    else if (data.type === 'answer_error') {
+      console.error('❌ AI Analysis Error:', data.message);
+      setAiInterviewerStatus("listening");
+      addMessage(`❌ ${data.message || 'AI analysis failed. Please try again.'}`, 'system', new Date().toISOString());
     }
     else if (data.type === 'screen_share_state') {
       console.log('🖥️ Interviewer screen share state update:', data.isSharing);
       setIsInterviewerScreenSharing(data.isSharing);
-    } 
-    else if (data.type === 'ai_interviewer_start') {
-      console.log('🤖 AI Interviewer starting via WebRTC:', data);
+    }    else if (data.type === 'ai_interviewer_ready') {
+      console.log('🤖 AI Interviewer is ready, waiting for resume...');
+      setAiInterviewerStatus("idle");
+      addMessage("🤖 AI Interviewer is ready and waiting for your resume.", 'system', new Date().toISOString());
+      
+    } else if (data.type === 'ai_interviewer_start' || data.type === 'ai_interview_started') {
+      console.log('🤖 AI Interviewer starting via WebRTC');
       setAiInterviewerActive(true);
       setInterviewMode("ai");
       setIsManualMode(false);
@@ -641,8 +673,10 @@ function ParticipantRoom({ room, onLeave }) {
       setInterviewMode(data.mode);
       setIsManualMode(data.mode === "manual");
       
-      if (data.mode === "ai" && !aiInterviewerActive) {
-        addMessage("🤖 Interviewer switched to AI mode. AI Interviewer will start soon.", 'system', new Date().toISOString());
+      if (data.mode === "ai") {
+        setAiInterviewerActive(false); // Wait for explicit start or first question
+        setAiInterviewerStatus("idle");
+        addMessage("🤖 Interviewer switched to AI mode. AI Interviewer is preparing...", 'system', new Date().toISOString());
         
         if (!isResumeUploaded) {
           addMessage("⚠️ Please upload your resume to enable AI interview.", 'system', new Date().toISOString());
@@ -661,18 +695,31 @@ function ParticipantRoom({ room, onLeave }) {
   };
 
   // Function to speak the question
+  // Function to speak the question
   const speakQuestion = (text) => {
-    if (!text) return;
+    if (!text) {
+      setAiInterviewerStatus("listening");
+      setIsListeningForResponse(true);
+      return;
+    }
     
-    // Always clear any existing timeouts
+    // Clear any existing speech and timeouts
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    
     if (window.ttsSafetyTimeout) {
       clearTimeout(window.ttsSafetyTimeout);
     }
 
     if (voiceEnabled && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+      // Set status immediately to avoid "idle" or "analyzing" lock
+      setAiInterviewerStatus("speaking");
+      setIsListeningForResponse(false);
       
       const utterance = new SpeechSynthesisUtterance(text);
+      utteranceRef.current = utterance; // Prevent garbage collection
+      
       utterance.rate = 0.95;
       utterance.pitch = 1.0;
       utterance.volume = 1.0;
@@ -689,9 +736,9 @@ function ParticipantRoom({ room, onLeave }) {
       }
       
       utterance.onstart = () => {
-        console.log('🗣️ TTS started');
+        console.log('🗣️ TTS started successfully');
+        // Redundant but safe
         setAiInterviewerStatus("speaking");
-        setIsListeningForResponse(false);
       };
       
       const handleSpeechEnd = () => {
@@ -700,8 +747,11 @@ function ParticipantRoom({ room, onLeave }) {
           clearTimeout(window.ttsSafetyTimeout);
           window.ttsSafetyTimeout = null;
         }
+        
+        // Ensure we transition to listening
         setAiInterviewerStatus("listening");
         setIsListeningForResponse(true);
+        utteranceRef.current = null;
         addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
       };
 
@@ -709,20 +759,28 @@ function ParticipantRoom({ room, onLeave }) {
       
       utterance.onerror = (event) => {
         console.error('TTS error:', event);
+        // Don't get stuck on error
         handleSpeechEnd();
       };
       
-      // Safety timeout based on text length (approx 150ms per word + 5s buffer)
+      // Safety timeout - reduced slightly for better responsiveness
       const wordCount = text.split(/\s+/).length;
-      const estimatedDuration = Math.max(5000, (wordCount * 500) + 5000);
+      const estimatedDuration = Math.max(4000, (wordCount * 450) + 3000);
+      
       window.ttsSafetyTimeout = setTimeout(() => {
-        console.warn('⚠️ TTS safety timeout reached');
+        console.warn('⚠️ TTS safety timeout reached - forcing listening status');
         handleSpeechEnd();
       }, estimatedDuration);
 
-      window.speechSynthesis.speak(utterance);
-      console.log(`🗣️ Playing TTS (Est. duration: ${estimatedDuration}ms)`);
+      try {
+        window.speechSynthesis.speak(utterance);
+        console.log(`🗣️ Playing TTS (Est. duration: ${estimatedDuration}ms)`);
+      } catch (err) {
+        console.error('❌ Error calling speechSynthesis.speak:', err);
+        handleSpeechEnd();
+      }
     } else {
+      console.log('🔇 Voice disabled or TTS not supported - switching to listening');
       setAiInterviewerStatus("listening");
       setIsListeningForResponse(true);
       addMessage("👂 AI is waiting for your response. Please type your answer.", 'system', new Date().toISOString());
@@ -1916,7 +1974,7 @@ function ParticipantRoom({ room, onLeave }) {
                     question={currentQuestion}
                     answer={responseText}
                     setAnswer={setResponseText}
-                    disabled={aiInterviewerStatus !== "listening" || isResponding}
+                    disabled={connectionStatus !== "connected" || isExplicitlyClosing}
                     onSubmit={() => {
                       console.log('🎤 Submitting answer:', responseText);
                       handleCandidateResponse(responseText);
