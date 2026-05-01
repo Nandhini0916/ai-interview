@@ -51,7 +51,13 @@ function ParticipantRoom({ room, onLeave }) {
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("disconnected");
-  const [currentSessionId, setCurrentSessionId] = useState(null);
+  const [currentSessionId, setCurrentSessionIdState] = useState(null);
+  
+  // Custom setter to keep ref in sync
+  const setCurrentSessionId = (id) => {
+    currentSessionIdRef.current = id;
+    setCurrentSessionIdState(id);
+  };
   const [chatOnline, setChatOnline] = useState(false);
   const [showChat, setShowChat] = useState(true);
   const [signalingConnected, setSignalingConnected] = useState(false);
@@ -109,6 +115,7 @@ function ParticipantRoom({ room, onLeave }) {
   const reconnectDelay = 3000;
   const utteranceRef = useRef(null);
   const analysisTimeoutRef = useRef(null);
+  const currentSessionIdRef = useRef(null);
 
   const PYTHON_API_URL = 'http://localhost:8001';
   const NODE_API_URL = 'http://localhost:8000/api';
@@ -1615,6 +1622,12 @@ function ParticipantRoom({ room, onLeave }) {
 
   const createSession = async () => {
     try {
+      // If we already have a session ID from the interviewer, reuse it!
+      if (currentSessionId && currentSessionId.includes('interviewer')) {
+        console.log('🆔 Reusing existing interviewer session ID:', currentSessionId);
+        return currentSessionId;
+      }
+
       const user = JSON.parse(localStorage.getItem('interviewUser') || '{}');
       const sessionId = `session-${room.id}-participant-${Date.now()}`;
       
@@ -1635,6 +1648,16 @@ function ParticipantRoom({ room, onLeave }) {
       if (result.success) {
         console.log('✅ Participant session created:', sessionId);
         setCurrentSessionId(sessionId);
+        
+        // Notify Python backend about this new session as well
+        try {
+          await fetch(`${PYTHON_API_URL}/start_interview?session_id=${sessionId}&room_id=${room.id}`, {
+            method: 'POST'
+          });
+        } catch (e) {
+          console.warn('⚠️ Could not notify Python backend of new session');
+        }
+        
         return sessionId;
       } else {
         console.error('❌ Failed to create participant session:', result.message);

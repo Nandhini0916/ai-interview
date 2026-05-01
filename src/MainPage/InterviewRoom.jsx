@@ -33,7 +33,13 @@ function InterviewRoom({ room, onLeave }) {
   const [showChat, setShowChat] = useState(false);
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState("");
-  const [currentSessionId, setCurrentSessionId] = useState(null);
+  const [currentSessionId, setCurrentSessionIdState] = useState(null);
+  
+  // Custom setter to keep ref in sync
+  const setCurrentSessionId = (id) => {
+    currentSessionIdRef.current = id;
+    setCurrentSessionIdState(id);
+  };
   const [referenceFaceSet, setReferenceFaceSet] = useState(false);
   const [capturingReference, setCapturingReference] = useState(false);
   const [chatConnected, setChatConnected] = useState(false);
@@ -89,6 +95,7 @@ function InterviewRoom({ room, onLeave }) {
   const reconnectTimeoutRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
   const maxReconnectAttempts = 5;
+  const currentSessionIdRef = useRef(null);
 
   const PYTHON_API_URL = 'http://localhost:8001';
   const NODE_API_URL = 'http://localhost:8000/api';
@@ -346,8 +353,8 @@ function InterviewRoom({ room, onLeave }) {
         addMessage(data.answer, 'participant', data.timestamp || new Date().toISOString());
         addMessage("🤖 AI is analyzing response...", 'system', new Date().toISOString());
         
-        // Forward the answer to Python backend
-        const effectiveSessionId = data.session_id || currentSessionId;
+        // Forward the answer to Python backend - ALWAYS prefer interviewer's registered session ID
+        const effectiveSessionId = currentSessionIdRef.current || data.session_id;
         
         if (effectiveSessionId && (aiInterviewerActive || interviewMode === 'ai')) {
           console.log('📤 Submitting participant answer to Python backend...');
@@ -2175,11 +2182,12 @@ function InterviewRoom({ room, onLeave }) {
     }
     
     // Also register session with WebSocket if available
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && currentSessionId) {
-      console.log('🔌 Registering session with AI backend via WS:', currentSessionId);
+    const sessionIdToRegister = currentSessionIdRef.current || currentSessionId;
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && sessionIdToRegister) {
+      console.log('🔌 Registering session with AI backend via WS:', sessionIdToRegister);
       wsRef.current.send(JSON.stringify({
         type: 'register_session',
-        session_id: currentSessionId,
+        session_id: sessionIdToRegister,
         room_id: room.id
       }));
     }

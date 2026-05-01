@@ -206,7 +206,7 @@ function ParticipantAIInterviewQA({
       const formData = new FormData();
       formData.append('audio', blob, 'recording.webm');
       
-      const response = await fetch('http://localhost:8001/voice/transcribe', {
+      const response = await fetch('http://localhost:8001/transcribe', {
         method: 'POST',
         body: formData,
         signal: AbortSignal.timeout(15000) // 15 second timeout
