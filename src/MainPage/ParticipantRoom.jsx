@@ -100,7 +100,6 @@ function ParticipantRoom({ room, onLeave }) {
   const canvasRef = useRef(null);
   const frameIntervalRef = useRef(null);
   const wsRef = useRef(null);
-  const aiWsRef = useRef(null);
   const webrtcManagerRef = useRef(null);
   const fileInputRef = useRef(null);
   const connectionMonitorRef = useRef(null);
@@ -255,8 +254,8 @@ function ParticipantRoom({ room, onLeave }) {
         });
       }
       
-      if (aiInterviewerActive && aiWsRef.current && aiWsRef.current.readyState === WebSocket.OPEN) {
-        aiWsRef.current.send(JSON.stringify({
+      if (aiInterviewerActive && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
           type: 'resume_uploaded',
           session_id: currentSessionId,
           resume_text: browserExtraction.extracted_text || 'Resume uploaded',
@@ -456,55 +455,14 @@ function ParticipantRoom({ room, onLeave }) {
       if (result.next_question) {
         console.log('📝 Next question received:', result.next_question);
         
-        setAiInterviewerStatus("speaking");
-        
         setTimeout(() => {
           setCurrentQuestion(result.next_question);
           addMessage(result.next_question, 'ai_interviewer', new Date().toISOString());
           setQuestionHistory(prev => [...prev, result.next_question]);
           
-          // Play TTS for next question
-          if (voiceEnabled && 'speechSynthesis' in window) {
-            window.speechSynthesis.cancel();
-            
-            const utterance = new SpeechSynthesisUtterance(result.next_question);
-            utterance.rate = 0.95;
-            utterance.pitch = 1.0;
-            utterance.volume = 1.0;
-            utterance.lang = 'en-US';
-            
-            const voices = window.speechSynthesis.getVoices();
-            const preferredVoice = voices.find(voice => 
-              voice.lang === 'en-US' && !voice.name.includes('Microsoft') && voice.name.includes('Google')
-            ) || voices.find(voice => voice.lang === 'en-US');
-            if (preferredVoice) utterance.voice = preferredVoice;
-            
-            utterance.onstart = () => {
-              setAiInterviewerStatus("speaking");
-              setIsListeningForResponse(false);
-            };
-            
-            utterance.onend = () => {
-              setAiInterviewerStatus("listening");
-              setIsListeningForResponse(true);
-              addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-            };
-            
-            utterance.onerror = () => {
-              setAiInterviewerStatus("listening");
-              setIsListeningForResponse(true);
-            };
-            
-            window.speechSynthesis.speak(utterance);
-          } else {
-            setTimeout(() => {
-              setAiInterviewerStatus("listening");
-              setIsListeningForResponse(true);
-              addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-            }, 2000);
-          }
+          // Use unified robust speakQuestion function
+          speakQuestion(result.next_question);
         }, 1000);
-        
       } else if (result.is_complete || result.final_results) {
         console.log('🎉 Interview completed!');
         setAiInterviewerStatus("complete");
@@ -569,39 +527,7 @@ function ParticipantRoom({ room, onLeave }) {
         addMessage(nextQuestion, 'ai_interviewer', new Date().toISOString());
         setQuestionHistory(prev => [...prev, nextQuestion]);
         
-        setAiInterviewerStatus("speaking");
-        setIsListeningForResponse(false);
-        
-        if (voiceEnabled && 'speechSynthesis' in window) {
-          const utterance = new SpeechSynthesisUtterance(nextQuestion);
-          utterance.rate = 0.95;
-          utterance.pitch = 1.0;
-          utterance.volume = 1.0;
-          utterance.lang = 'en-US';
-          
-          const voices = window.speechSynthesis.getVoices();
-          const preferredVoice = voices.find(voice => 
-            voice.lang === 'en-US' && !voice.name.includes('Microsoft') && voice.name.includes('Google')
-          ) || voices.find(voice => voice.lang === 'en-US');
-          if (preferredVoice) utterance.voice = preferredVoice;
-          
-          utterance.onstart = () => {
-            setAiInterviewerStatus("speaking");
-          };
-          
-          utterance.onend = () => {
-            setAiInterviewerStatus("listening");
-            setIsListeningForResponse(true);
-            addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-          };
-          
-          window.speechSynthesis.speak(utterance);
-        } else {
-          setTimeout(() => {
-            setAiInterviewerStatus("listening");
-            setIsListeningForResponse(true);
-          }, 2000);
-        }
+        speakQuestion(nextQuestion);
       } else {
         console.warn('⚠️ No question received from REST API');
         setAiInterviewerStatus("listening");
@@ -622,268 +548,7 @@ function ParticipantRoom({ room, onLeave }) {
     }
   };
 
-  const connectToAIInterviewer = () => {
-    if (isExplicitlyClosing) return;
-    
-    if (aiWsRef.current && aiWsRef.current.readyState === WebSocket.OPEN) {
-      console.log('AI WebSocket already connected');
-      return;
-    }
-    
-    if (aiWsRef.current && aiWsRef.current.readyState === WebSocket.CONNECTING) {
-      console.log('AI WebSocket already connecting');
-      return;
-    }
-    
-    try {
-      if (aiWsRef.current) {
-        if (aiWsRef.current.pingInterval) clearInterval(aiWsRef.current.pingInterval);
-        if (aiWsRef.current.pongTimeout) clearTimeout(aiWsRef.current.pongTimeout);
-        aiWsRef.current.close();
-      }
-      
-      console.log('🔌 Connecting to AI WebSocket at ws://localhost:8001/ws');
-      const ws = new WebSocket("ws://localhost:8001/ws");
-      let pingInterval = null;
-      let pongTimeout = null;
-      
-      ws.onopen = () => {
-        console.log("✅ Connected to AI WebSocket");
-        
-        pingInterval = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
-            if (pongTimeout) clearTimeout(pongTimeout);
-            pongTimeout = setTimeout(() => {
-              console.warn("⚠️ No pong from AI server, reconnecting...");
-              if (ws.readyState === WebSocket.OPEN) ws.close();
-            }, 10000);
-          }
-        }, 25000);
-        
-        if (currentSessionId) {
-          console.log('📝 Registering session:', currentSessionId);
-          ws.send(JSON.stringify({
-            type: 'register_session',
-            session_id: currentSessionId,
-            room_id: room.id
-          }));
-          
-          setTimeout(() => {
-            if (ws.readyState === WebSocket.OPEN) {
-              setAiInterviewerActive(true);
-              setAiInterviewerStatus("connected");
-              console.log('🤖 AI Interviewer connected and registered');
-            }
-          }, 500);
-        } else {
-          console.warn('⚠️ No session ID available for registration');
-          setAiInterviewerStatus("idle");
-        }
-        
-        addMessage("🤖 Connected to AI Interviewer", 'system', new Date().toISOString());
-      };
-      
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          
-          if (data.type === 'ping') {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
-            }
-            return;
-          }
-          
-          if (data.type === 'pong') {
-            if (pongTimeout) clearTimeout(pongTimeout);
-            return;
-          }
-          
-          console.log("🤖 AI WebSocket Message:", data.type);
-          
-          switch (data.type) {
-            case 'session_registered':
-              console.log('✅ Session registered successfully:', data);
-              setAiInterviewerActive(true);
-              setAiInterviewerStatus("connected");
-              
-              if (isResumeUploaded && !currentQuestion) {
-                console.log('📄 Resume uploaded, starting AI interview...');
-                setTimeout(() => {
-                  if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({
-                      type: 'command',
-                      command: 'start_ai_interview',
-                      session_id: currentSessionId,
-                      level: 'medium',
-                      room_id: room.id,
-                      use_voice: voiceEnabled
-                    }));
-                  }
-                }, 1000);
-              } else if (!isResumeUploaded) {
-                addMessage("📄 Please upload your resume to start the AI interview.", 'system', new Date().toISOString());
-                setAiInterviewerStatus("idle");
-              }
-              break;
-              
-            case 'interview_started':
-              console.log('🎬 AI interview started:', data);
-              setAiInterviewerActive(true);
-              
-              if (data.questions && data.questions.length > 0) {
-                const firstQuestion = data.questions[0];
-                console.log('📝 Setting first question:', firstQuestion);
-                setCurrentQuestion(firstQuestion);
-                addMessage(firstQuestion, 'ai_interviewer', new Date().toISOString());
-                setQuestionHistory([firstQuestion]);
-                
-                setAiInterviewerStatus("speaking");
-                setIsListeningForResponse(false);
-                
-                if (voiceEnabled && 'speechSynthesis' in window) {
-                  const utterance = new SpeechSynthesisUtterance(firstQuestion);
-                  utterance.rate = 0.95;
-                  utterance.pitch = 1.0;
-                  utterance.volume = 1.0;
-                  utterance.lang = 'en-US';
-                  
-                  const voices = window.speechSynthesis.getVoices();
-                  if (voices.length > 0) {
-                    const preferredVoice = voices.find(voice => 
-                      voice.lang.includes('en') && !voice.name.includes('Microsoft')
-                    );
-                    if (preferredVoice) utterance.voice = preferredVoice;
-                  }
-                  
-                  utterance.onstart = () => {
-                    setAiInterviewerStatus("speaking");
-                    setIsListeningForResponse(false);
-                  };
-                  
-                  utterance.onend = () => {
-                    setAiInterviewerStatus("listening");
-                    setIsListeningForResponse(true);
-                    addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-                  };
-                  
-                  utterance.onerror = () => {
-                    setAiInterviewerStatus("listening");
-                    setIsListeningForResponse(true);
-                  };
-                  
-                  window.speechSynthesis.speak(utterance);
-                } else {
-                  setTimeout(() => {
-                    setAiInterviewerStatus("listening");
-                    setIsListeningForResponse(true);
-                  }, 3000);
-                }
-              }
-              break;
-              
-            case 'answer_result':
-              console.log('📊 Answer result received:', data);
-              
-              if (data.score !== undefined) {
-                addMessage(`📊 Score: ${data.score}/10 - ${data.feedback || 'Good response!'}`, 'system', new Date().toISOString());
-              }
-              
-              if (data.next_question) {
-                setAiInterviewerStatus("speaking");
-                setIsListeningForResponse(false);
-                
-                setTimeout(() => {
-                  setCurrentQuestion(data.next_question);
-                  addMessage(data.next_question, 'ai_interviewer', new Date().toISOString());
-                  setQuestionHistory(prev => [...prev, data.next_question]);
-                  
-                  if (voiceEnabled && 'speechSynthesis' in window) {
-                    const utterance = new SpeechSynthesisUtterance(data.next_question);
-                    utterance.rate = 0.95;
-                    utterance.pitch = 1.0;
-                    utterance.volume = 1.0;
-                    utterance.lang = 'en-US';
-                    
-                    utterance.onstart = () => {
-                      setAiInterviewerStatus("speaking");
-                    };
-                    utterance.onend = () => {
-                      setAiInterviewerStatus("listening");
-                      setIsListeningForResponse(true);
-                    };
-                    window.speechSynthesis.speak(utterance);
-                  } else {
-                    setTimeout(() => {
-                      setAiInterviewerStatus("listening");
-                      setIsListeningForResponse(true);
-                    }, 2000);
-                  }
-                }, 1000);
-              } else if (data.is_complete) {
-                setAiInterviewerStatus("complete");
-                setIsListeningForResponse(false);
-                addMessage(`🎉 Interview Completed!`, 'system', new Date().toISOString());
-              }
-              break;
-              
-            case 'detection':
-              if (data.faces !== undefined) {
-                console.log('🔍 Detection update:', data.faces, 'faces,', data.gender);
-              }
-              break;
-              
-            case 'error':
-              console.error('❌ AI Error:', data.message);
-              setAiInterviewerStatus("listening");
-              setIsListeningForResponse(true);
-              addMessage(`⚠️ ${data.message}`, 'system', new Date().toISOString());
-              break;
-              
-            default:
-              console.log('📨 Unknown message type:', data.type);
-          }
-        } catch (err) {
-          console.error("❌ Error parsing AI message:", err);
-        }
-      };
-      
-      ws.onclose = (event) => {
-        console.log("🔌 AI WebSocket disconnected:", event.code, event.reason);
-        if (pingInterval) clearInterval(pingInterval);
-        if (pongTimeout) clearTimeout(pongTimeout);
-        
-        setAiInterviewerActive(false);
-        setAiInterviewerStatus("disconnected");
-        setIsListeningForResponse(false);
-        addMessage("🔌 AI Interviewer disconnected", 'system', new Date().toISOString());
-        
-        setTimeout(() => {
-          if (!isExplicitlyClosing && interviewMode === "ai" && !aiInterviewerActive) {
-            console.log("🔄 Attempting to reconnect to AI...");
-            connectToAIInterviewer();
-          }
-        }, 3000);
-      };
-      
-      ws.onerror = (error) => {
-        console.error("❌ AI WebSocket error:", error);
-        setAiInterviewerStatus("error");
-        addMessage("❌ AI connection error", 'system', new Date().toISOString());
-      };
-      
-      aiWsRef.current = ws;
-      aiWsRef.current.pingInterval = pingInterval;
-      aiWsRef.current.pongTimeout = pongTimeout;
-      
-    } catch (err) {
-      console.error("❌ AI WebSocket connection failed:", err);
-      setAiInterviewerActive(false);
-      setAiInterviewerStatus("error");
-      addMessage("❌ Failed to connect to AI", 'system', new Date().toISOString());
-    }
-  };
+
 
   const handleWebRTCMessage = (data) => {
     console.log('📨 Participant received WebRTC message:', data.type);
@@ -919,15 +584,8 @@ function ParticipantRoom({ room, onLeave }) {
       
       addMessage(data.question, 'ai_interviewer', new Date().toISOString());
       
-      if (voiceEnabled && 'speechSynthesis' in window && interviewMode === "ai") {
+      if (interviewMode === "ai") {
         speakQuestion(data.question);
-      } else if (interviewMode === "ai") {
-        setAiInterviewerStatus("speaking");
-        setTimeout(() => {
-          setAiInterviewerStatus("listening");
-          setIsListeningForResponse(true);
-          addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
-        }, 3000);
       }
     }
     else if (data.type === 'screen_share_state') {
@@ -951,10 +609,7 @@ function ParticipantRoom({ room, onLeave }) {
         setCurrentQuestion(data.questions[0]);
         setQuestionHistory([data.questions[0]]);
         addMessage(data.questions[0], 'ai_interviewer', new Date().toISOString());
-        
-        if (voiceEnabled && 'speechSynthesis' in window) {
-          speakQuestion(data.questions[0]);
-        }
+        speakQuestion(data.questions[0]);
       }
       
       addMessage("🤖 AI Interviewer has been started by interviewer", 'system', new Date().toISOString());
@@ -972,10 +627,10 @@ function ParticipantRoom({ room, onLeave }) {
       setIsListeningForResponse(false);
       addMessage("🤖 AI Interviewer has been stopped. Manual mode activated.", 'system', new Date().toISOString());
       
-      if (aiWsRef.current) {
-        if (aiWsRef.current.pingInterval) clearInterval(aiWsRef.current.pingInterval);
-        if (aiWsRef.current.pongTimeout) clearTimeout(aiWsRef.current.pongTimeout);
-        aiWsRef.current.close();
+      if (wsRef.current) {
+        if (wsRef.current.pingInterval) clearInterval(wsRef.current.pingInterval);
+        if (wsRef.current.pongTimeout) clearTimeout(wsRef.current.pongTimeout);
+        wsRef.current.close();
       }
       
       if ('speechSynthesis' in window) {
@@ -1007,9 +662,14 @@ function ParticipantRoom({ room, onLeave }) {
 
   // Function to speak the question
   const speakQuestion = (text) => {
-    if (!voiceEnabled || !text) return;
+    if (!text) return;
     
-    if ('speechSynthesis' in window) {
+    // Always clear any existing timeouts
+    if (window.ttsSafetyTimeout) {
+      clearTimeout(window.ttsSafetyTimeout);
+    }
+
+    if (voiceEnabled && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
       
       const utterance = new SpeechSynthesisUtterance(text);
@@ -1034,21 +694,34 @@ function ParticipantRoom({ room, onLeave }) {
         setIsListeningForResponse(false);
       };
       
-      utterance.onend = () => {
-        console.log('🗣️ TTS finished');
+      const handleSpeechEnd = () => {
+        console.log('🗣️ TTS finished or timed out');
+        if (window.ttsSafetyTimeout) {
+          clearTimeout(window.ttsSafetyTimeout);
+          window.ttsSafetyTimeout = null;
+        }
         setAiInterviewerStatus("listening");
         setIsListeningForResponse(true);
         addMessage("👂 AI is waiting for your response...", 'system', new Date().toISOString());
       };
+
+      utterance.onend = handleSpeechEnd;
       
       utterance.onerror = (event) => {
         console.error('TTS error:', event);
-        setAiInterviewerStatus("listening");
-        setIsListeningForResponse(true);
+        handleSpeechEnd();
       };
       
+      // Safety timeout based on text length (approx 150ms per word + 5s buffer)
+      const wordCount = text.split(/\s+/).length;
+      const estimatedDuration = Math.max(5000, (wordCount * 500) + 5000);
+      window.ttsSafetyTimeout = setTimeout(() => {
+        console.warn('⚠️ TTS safety timeout reached');
+        handleSpeechEnd();
+      }, estimatedDuration);
+
       window.speechSynthesis.speak(utterance);
-      console.log('🗣️ Playing TTS for AI question');
+      console.log(`🗣️ Playing TTS (Est. duration: ${estimatedDuration}ms)`);
     } else {
       setAiInterviewerStatus("listening");
       setIsListeningForResponse(true);
@@ -1153,7 +826,7 @@ function ParticipantRoom({ room, onLeave }) {
             
             if (aiInterviewerActive && !isExplicitlyClosing) {
               setTimeout(() => {
-                connectToAIInterviewer();
+                connectWebSocket();
               }, 1000);
             }
           } else if (state === 'connecting') {
@@ -1357,7 +1030,8 @@ function ParticipantRoom({ room, onLeave }) {
           } else if (data.type === 'ai_interview_started') {
             console.log('🤖 AI interview started:', data);
             setAiInterviewerActive(true);
-            setAiInterviewerStatus("speaking");
+            setInterviewMode("ai");
+            setIsManualMode(false);
             addMessage("🎬 AI Interview Started", 'system', new Date().toISOString());
             
             if (data.questions && data.questions.length > 0) {
@@ -1380,14 +1054,12 @@ function ParticipantRoom({ room, onLeave }) {
 
             if (data.next_question) {
               console.log('📝 Next question received:', data.next_question);
-              setAiInterviewerStatus("speaking");
-              setIsListeningForResponse(false);
               setTimeout(() => {
                 setCurrentQuestion(data.next_question);
                 addMessage(data.next_question, 'ai_interviewer', new Date().toISOString());
                 speakQuestion(data.next_question);
                 setQuestionHistory(prev => [...prev, data.next_question]);
-              }, 2000);
+              }, 1000);
             } else if (data.final_results) {
               console.log('🎉 Final results received:', data.final_results);
               setAiInterviewerStatus("complete");
@@ -1404,6 +1076,9 @@ function ParticipantRoom({ room, onLeave }) {
             }
           } else if (data.type === 'new_question') {
             console.log('📝 New question from AI:', data.question);
+            setAiInterviewerActive(true);
+            setInterviewMode("ai");
+            setIsManualMode(false);
             setCurrentQuestion(data.question);
             addMessage(data.question, 'ai_interviewer', new Date().toISOString());
             speakQuestion(data.question);
@@ -1694,18 +1369,7 @@ function ParticipantRoom({ room, onLeave }) {
       setAiConnected(false);
     }
 
-    if (aiWsRef.current) {
-      if (aiWsRef.current.pingInterval) clearInterval(aiWsRef.current.pingInterval);
-      if (aiWsRef.current.pongTimeout) clearTimeout(aiWsRef.current.pongTimeout);
-      aiWsRef.current.close();
-      setAiInterviewerActive(false);
-      setAiInterviewerStatus("idle");
-      setCurrentQuestion("");
-      setQuestionHistory([]);
-      setResponseAnalysis(null);
-      setIsResponding(false);
-      setIsListeningForResponse(false);
-    }
+
 
     if (webrtcManagerRef.current) {
       webrtcManagerRef.current.isClosed = true;

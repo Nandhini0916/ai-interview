@@ -27,7 +27,7 @@ function ParticipantAIInterviewQA({
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcriptionError, setTranscriptionError] = useState(null);
   const [showTips, setShowTips] = useState(true);
-  const [hasSpokenQuestion, setHasSpokenQuestion] = useState(false);
+
   const [answerSubmitted, setAnswerSubmitted] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   
@@ -84,25 +84,13 @@ function ParticipantAIInterviewQA({
     }
   }, [isResponding, localResponding]);
   
-  // Speak question when AI is in speaking mode - ONLY ONCE per question
-  useEffect(() => {
-    if (voiceEnabled && question && aiInterviewerStatus === 'speaking' && !hasSpokenQuestion && question !== "Waiting for AI question...") {
-      setHasSpokenQuestion(true);
-      speakQuestion();
-    }
-  }, [question, aiInterviewerStatus, voiceEnabled, hasSpokenQuestion]);
+
   
   // Reset hasSpokenQuestion when question changes
   useEffect(() => {
-    setHasSpokenQuestion(false);
     setAnswerSubmitted(false);
     setLocalResponding(false);
     setIsSubmitting(false);
-    // Clear any pending submit timeout
-    if (submitTimeoutRef.current) {
-      clearTimeout(submitTimeoutRef.current);
-      submitTimeoutRef.current = null;
-    }
   }, [question]);
   
   // Cleanup recording on unmount
@@ -119,50 +107,7 @@ function ParticipantAIInterviewQA({
     };
   }, []);
   
-  const speakQuestion = () => {
-    if (!voiceEnabled || !window.speechSynthesis || !question) return;
-    
-    // Cancel any ongoing speech
-    window.speechSynthesis.cancel();
-    
-    const utterance = new SpeechSynthesisUtterance(question);
-    utterance.rate = 0.95;
-    utterance.pitch = 1.0;
-    utterance.volume = 1.0;
-    utterance.lang = 'en-US';
-    
-    // Try to get available voices
-    const speakWithVoices = () => {
-      const voices = window.speechSynthesis.getVoices();
-      const preferredVoice = voices.find(voice => 
-        voice.lang === 'en-US' && !voice.name.includes('Microsoft') && voice.name.includes('Google')
-      ) || voices.find(voice => voice.lang === 'en-US');
-      if (preferredVoice) {
-        utterance.voice = preferredVoice;
-      }
-    };
-    
-    if (window.speechSynthesis.getVoices().length === 0) {
-      window.speechSynthesis.onvoiceschanged = speakWithVoices;
-    } else {
-      speakWithVoices();
-    }
-    
-    utterance.onstart = () => {
-      console.log('🗣️ AI question speaking started');
-    };
-    
-    utterance.onend = () => {
-      console.log('🗣️ AI question speaking completed');
-    };
-    
-    utterance.onerror = (event) => {
-      console.error('Speech synthesis error:', event);
-    };
-    
-    currentUtteranceRef.current = utterance;
-    window.speechSynthesis.speak(utterance);
-  };
+
   
   // Start voice recording
   const startRecording = async () => {
