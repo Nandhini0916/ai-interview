@@ -274,6 +274,7 @@ function InterviewRoom({ room, onLeave }) {
                 type: 'resume_sync_complete',
                 message: 'Resume ready for AI interview',
                 room_id: data.room_id || room.id,
+                session_id: currentSessionId,
                 timestamp: new Date().toISOString()
               });
             }
@@ -346,8 +347,15 @@ function InterviewRoom({ room, onLeave }) {
         addMessage("🤖 AI is analyzing response...", 'system', new Date().toISOString());
         
         // Forward the answer to Python backend
-        if (currentSessionId && aiInterviewerActive) {
+        const effectiveSessionId = data.session_id || currentSessionId;
+        
+        if (effectiveSessionId && (aiInterviewerActive || interviewMode === 'ai')) {
           console.log('📤 Submitting participant answer to Python backend...');
+          
+          // Ensure AI is marked as active if we're receiving answers in AI mode
+          if (!aiInterviewerActive && interviewMode === 'ai') {
+            setAiInterviewerActive(true);
+          }
           
           fetch(`${PYTHON_API_URL}/submit_ai_answer`, {
             method: "POST",
@@ -356,7 +364,7 @@ function InterviewRoom({ room, onLeave }) {
               'Accept': 'application/json'
             },
             body: JSON.stringify({
-              session_id: data.session_id || currentSessionId,
+              session_id: effectiveSessionId,
               question: data.question,
               answer: data.answer,
               room_id: room.id
@@ -375,7 +383,7 @@ function InterviewRoom({ room, onLeave }) {
             
             // Add to chat for visibility
             if (result.score !== undefined) {
-              addMessage(`📊 Participant score: ${result.score}/10`, 'system', new Date().toISOString());
+              addMessage(`Participant score: ${result.score}/10`, 'system', new Date().toISOString());
             }
             
             // Forward result back to participant via WebRTC
@@ -387,6 +395,7 @@ function InterviewRoom({ room, onLeave }) {
                 next_question: result.next_question,
                 is_complete: result.is_complete,
                 final_results: result.final_results,
+                session_id: effectiveSessionId,
                 timestamp: new Date().toISOString()
               });
               console.log('📤 Sent answer result to participant via WebRTC');
@@ -418,13 +427,14 @@ function InterviewRoom({ room, onLeave }) {
               webrtcManagerRef.current.sendData('chat', {
                 type: 'answer_error',
                 message: 'AI backend failed to process your answer. Please try submitting again.',
+                session_id: effectiveSessionId,
                 timestamp: new Date().toISOString()
               });
             }
           });
         } else {
-          console.warn('⚠️ Cannot submit answer: Session ID missing or AI not active');
-          addMessage("⚠️ Cannot process answer: AI session not active", 'system', new Date().toISOString());
+          console.warn('⚠️ Cannot submit answer:', { effectiveSessionId, aiInterviewerActive, interviewMode });
+          addMessage(`⚠️ Cannot process answer: ${!effectiveSessionId ? 'No Session ID' : 'AI not active'}`, 'system', new Date().toISOString());
         }
         break;
         
@@ -491,6 +501,7 @@ function InterviewRoom({ room, onLeave }) {
         webrtcManagerRef.current.sendData('chat', {
           type: 'interview_mode_update',
           mode: requestedMode,
+          session_id: currentSessionId,
           timestamp: new Date().toISOString(),
           syncResponse: "accepted",
           source: 'interviewer'
@@ -508,6 +519,7 @@ function InterviewRoom({ room, onLeave }) {
         webrtcManagerRef.current.sendData('chat', {
           type: 'interview_mode_update',
           mode: interviewMode,
+          session_id: currentSessionId,
           timestamp: new Date().toISOString(),
           syncResponse: "rejected",
           reason: "Interviewer rejected",
@@ -676,6 +688,7 @@ function InterviewRoom({ room, onLeave }) {
                 webrtcManagerRef.current.sendData('chat', {
                   type: 'interview_mode_update',
                   mode: interviewMode,
+                  session_id: currentSessionId,
                   timestamp: new Date().toISOString()
                 });
               }
@@ -903,7 +916,8 @@ function InterviewRoom({ room, onLeave }) {
                     type: 'ai_answer_feedback',
                     score: data.score,
                     feedback: data.feedback,
-                    next_question: data.next_question
+                    next_question: data.next_question,
+                    session_id: currentSessionId
                   });
                 }
                 
@@ -914,7 +928,8 @@ function InterviewRoom({ room, onLeave }) {
                   webrtcManagerRef.current.sendData('chat', {
                     type: 'ai_answer_feedback',
                     final_results: data.final_results,
-                    is_complete: true
+                    is_complete: true,
+                    session_id: currentSessionId
                   });
                 }
               }
@@ -1143,6 +1158,7 @@ function InterviewRoom({ room, onLeave }) {
     if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
       webrtcManagerRef.current.sendData('chat', {
         type: 'ai_interviewer_stop',
+        session_id: currentSessionId,
         timestamp: new Date().toISOString(),
         message: 'AI Interview stopped by interviewer'
       });
@@ -1217,6 +1233,7 @@ function InterviewRoom({ room, onLeave }) {
         webrtcManagerRef.current.sendData('chat', {
           type: 'interview_mode_update',
           mode: newMode,
+          session_id: currentSessionId,
           timestamp: new Date().toISOString(),
           syncRequest: true,
           source: 'interviewer',
@@ -1642,9 +1659,12 @@ function InterviewRoom({ room, onLeave }) {
       
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       
-      const imageData = canvas.toDataURL('image/jpeg', 0.7);
+      const imageData = canvas.toDataURL('image/jpeg', 0.6); // Slightly lower quality for stability
       
-      if (wsRef.current.readyState === WebSocket.OPEN && currentSessionId) {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && currentSessionId) {
+        // Ensure we don't send if session ID is literally "None" or null
+        if (!currentSessionId || currentSessionId === "None") return;
+        
         const frameData = {
           type: 'participant_frame',
           image: imageData,
@@ -2118,6 +2138,7 @@ function InterviewRoom({ room, onLeave }) {
       if (webrtcManagerRef.current && webrtcManagerRef.current.isDataChannelOpen('chat')) {
         webrtcManagerRef.current.sendData('chat', {
           type: 'ai_interviewer_ready',
+          sessionId: currentSessionId,
           timestamp: new Date().toISOString(),
           message: 'Interviewer is ready. Please upload your resume to start.'
         });
@@ -2146,12 +2167,23 @@ function InterviewRoom({ room, onLeave }) {
       webrtcManagerRef.current.sendData('chat', {
         type: 'interview_mode_update',
         mode: interviewMode,
+        sessionId: currentSessionId,
         timestamp: new Date().toISOString()
       });
       
-      console.log(`📤 Sent mode update to participant: ${interviewMode}`);
+      console.log(`📤 Sent mode update to participant: ${interviewMode} with Session ID: ${currentSessionId}`);
     }
-  }, [interviewMode]);
+    
+    // Also register session with WebSocket if available
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && currentSessionId) {
+      console.log('🔌 Registering session with AI backend via WS:', currentSessionId);
+      wsRef.current.send(JSON.stringify({
+        type: 'register_session',
+        session_id: currentSessionId,
+        room_id: room.id
+      }));
+    }
+  }, [interviewMode, currentSessionId, aiConnected]);
 
   useEffect(() => {
     if (chatMessagesRef.current) {

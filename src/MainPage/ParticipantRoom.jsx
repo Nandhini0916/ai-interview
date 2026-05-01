@@ -621,6 +621,11 @@ function ParticipantRoom({ room, onLeave }) {
       setIsInterviewerScreenSharing(data.isSharing);
     }    else if (data.type === 'ai_interviewer_ready') {
       console.log('🤖 AI Interviewer is ready, waiting for resume...');
+      const newSessionId = data.sessionId || data.session_id;
+      if (newSessionId) {
+        console.log('🆔 Syncing session ID from interviewer:', newSessionId);
+        setCurrentSessionId(newSessionId);
+      }
       setAiInterviewerStatus("idle");
       addMessage("🤖 AI Interviewer is ready and waiting for your resume.", 'system', new Date().toISOString());
       
@@ -669,9 +674,15 @@ function ParticipantRoom({ room, onLeave }) {
         window.speechSynthesis.cancel();
       }
     } else if (data.type === 'interview_mode_update') {
-      console.log('🔄 Interview mode updated:', data.mode);
+      console.log('🔄 Interview mode updated:', data.mode, 'Session ID:', data.sessionId || data.session_id);
       setInterviewMode(data.mode);
       setIsManualMode(data.mode === "manual");
+      
+      const newSessionId = data.sessionId || data.session_id;
+      if (newSessionId) {
+        console.log('🆔 Syncing session ID from interviewer:', newSessionId);
+        setCurrentSessionId(newSessionId);
+      }
       
       if (data.mode === "ai") {
         setAiInterviewerActive(false); // Wait for explicit start or first question
