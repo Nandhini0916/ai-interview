@@ -2448,11 +2448,11 @@ function InterviewRoom({ room, onLeave }) {
                       muted
                       className={`video-element ${isScreenSharing ? 'screen-share' : 'mirror-effect'} ${interviewMode === 'ai' ? 'video-hidden' : ''}`}
                     />
-                    {interviewMode === 'ai' && (
+                    {interviewMode === 'ai' && !aiInterviewerActive && (
                       <div className="ai-mode-overlay">
                         <div className="ai-icon">🤖</div>
-                        <div>AI Interviewer Active</div>
-                        <div className="ai-mode-hint">Chat panel is open for AI communication</div>
+                        <div>AI Interviewer Ready</div>
+                        <div className="ai-mode-hint">Click Start AI to begin</div>
                       </div>
                     )}
                     {!isCameraOn && !isScreenSharing && interviewMode === 'manual' && (

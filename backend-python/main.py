@@ -1,6 +1,6 @@
 # main.py - COMPLETE FIXED VERSION
 # ==========================================================
-# FRAUD DETECTION & AI INTERVIEW SYSTEM - v1.1.0
+# FRAUD DETECTION & AI INTERVIEW SYSTEM - v1.2.0
 # ==========================================================
 
 import sys
@@ -32,7 +32,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 logger.info("=" * 60)
-logger.info("Starting Fraud Detection System v1.1.0")
+logger.info("Starting Fraud Detection System v1.2.0")
 logger.info("=" * 60)
 
 # Import FastAPI
@@ -70,7 +70,7 @@ except ImportError:
     logger.warning("PyPDF2 not available - PDF parsing disabled")
 
 # Create FastAPI app
-app = FastAPI(title="Fraud Detection & AI Interview", version="1.1.0")
+app = FastAPI(title="Fraud Detection & AI Interview", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,6 +82,7 @@ app.add_middleware(
 
 # Configuration
 WEBSOCKET_TIMEOUT = 600
+HEARTBEAT_INTERVAL = 20  # Send heartbeat every 20 seconds
 
 # Storage
 ai_sessions: Dict[str, InterviewSession] = {}
@@ -90,6 +91,7 @@ active_websockets: Dict[str, WebSocket] = {}
 frame_received_count: Dict[str, int] = {}
 latest_frames: Dict[str, np.ndarray] = {}
 session_rooms: Dict[str, str] = {}
+last_heartbeat: Dict[str, float] = {}
 
 
 # ==========================================================
@@ -709,7 +711,7 @@ async def frame_status():
 async def health():
     return {
         "status": "healthy",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "active_sessions": len(ai_sessions),
         "active_websockets": len(active_websockets),
         "resumes": len(resume_store),
@@ -723,7 +725,7 @@ async def health():
 @app.get("/")
 async def root():
     return {
-        "message": "Fraud Detection & AI Interview API v1.1.0",
+        "message": "Fraud Detection & AI Interview API v1.2.0",
         "status": "running",
         "endpoints": {
             "POST /upload_resume": "Upload resume (multipart/form-data or JSON)",
@@ -739,7 +741,7 @@ async def root():
 
 
 # ==========================================================
-# WebSocket Endpoint - FIXED for better frame handling
+# WebSocket Endpoint - FIXED with better keep-alive
 # ==========================================================
 
 @app.websocket("/ws")
@@ -748,24 +750,36 @@ async def websocket_endpoint(websocket: WebSocket):
     session_id = None
     room_id = None
     frame_count_this_session = 0
+    last_heartbeat_time = time.time()
+    heartbeat_interval = 25  # Send heartbeat every 25 seconds
     
     logger.info("=" * 40)
     logger.info("NEW WEBSOCKET CONNECTION")
     logger.info("=" * 40)
     
+    # Send connection confirmation immediately
+    await websocket.send_json({
+        "type": "connected",
+        "message": "Connected to AI server",
+        "timestamp": time.time()
+    })
+    logger.info("Sent connection confirmation")
+    
     try:
-        # Send connection confirmation immediately
-        await websocket.send_json({
-            "type": "connected",
-            "message": "Connected to AI server",
-            "timestamp": time.time()
-        })
-        logger.info("Sent connection confirmation")
-        
         while True:
             try:
+                current_time = time.time()
+                
+                # Send heartbeat if needed
+                if current_time - last_heartbeat_time > heartbeat_interval:
+                    await websocket.send_json({
+                        "type": "ping",
+                        "timestamp": current_time
+                    })
+                    last_heartbeat_time = current_time
+                
                 # Receive message with timeout
-                message = await asyncio.wait_for(websocket.receive_text(), timeout=WEBSOCKET_TIMEOUT)
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                 
                 try:
                     data = json.loads(message)
@@ -773,11 +787,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     # Handle ping
                     if msg_type == "ping":
-                        await websocket.send_json({"type": "pong", "timestamp": time.time()})
+                        await websocket.send_json({
+                            "type": "pong", 
+                            "timestamp": time.time(),
+                            "id": data.get("id", time.time())
+                        })
+                        continue
+                    
+                    # Handle pong
+                    if msg_type == "pong":
                         continue
                     
                     # Handle register_session
-                    if msg_type == "register_session" or msg_type == "command":
+                    if msg_type == "register_session":
                         sess_id = data.get("session_id")
                         cmd = data.get("command")
                         
@@ -787,6 +809,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             session_rooms[session_id] = room_id
                             active_websockets[session_id] = websocket
                             frame_received_count[session_id] = 0
+                            last_heartbeat[session_id] = time.time()
                             
                             logger.info(f"Session registered: {session_id}, room: {room_id}")
                             logger.info(f"Active WebSockets: {len(active_websockets)}")
@@ -848,10 +871,12 @@ async def websocket_endpoint(websocket: WebSocket):
                             frame_count_this_session += 1
                             if sess_id:
                                 frame_received_count[sess_id] = frame_received_count.get(sess_id, 0) + 1
+                                last_heartbeat[sess_id] = time.time()
                             
                             if frame_count_this_session % 30 == 0:
                                 logger.info(f"Frame #{frame_count_this_session} received for session {sess_id}")
                             
+                            # Process frame with reduced resolution for performance
                             result = face_detector.process_frame(frame_data, sess_id)
                             result["type"] = "detection"
                             await websocket.send_json(result)
@@ -902,11 +927,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 
             except asyncio.TimeoutError:
-                # Send heartbeat ping
-                try:
-                    await websocket.send_json({"type": "ping", "heartbeat": True, "timestamp": time.time()})
-                except:
-                    break
+                # Timeout is normal, just continue the loop
+                # The heartbeat will be sent on the next iteration
                 continue
                 
     except WebSocketDisconnect:
@@ -917,7 +939,8 @@ async def websocket_endpoint(websocket: WebSocket):
         if session_id:
             if session_id in active_websockets:
                 del active_websockets[session_id]
-            # Don't delete latest_frames immediately - keep for reference face
+            if session_id in last_heartbeat:
+                del last_heartbeat[session_id]
             if session_id in frame_received_count:
                 logger.info(f"Session {session_id} processed {frame_received_count[session_id]} frames")
         logger.info(f"WebSocket cleaned up: {session_id}")
@@ -931,7 +954,7 @@ async def shutdown():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Fraud Detection & AI Interview v1.1.0")
+    print("Fraud Detection & AI Interview v1.2.0")
     print("=" * 60)
     print("Server: http://localhost:8001")
     print("WebSocket: ws://localhost:8001/ws")

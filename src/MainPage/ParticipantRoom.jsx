@@ -330,11 +330,10 @@ function ParticipantRoom({ room, onLeave }) {
     }
   };
 
-  // Handle voice transcript - FIXED
+  // Handle voice transcript
   const handleVoiceTranscript = (transcript) => {
     console.log('🎤 Voice transcript received:', transcript);
     if (transcript && transcript.trim()) {
-      // Append to existing response text
       if (responseText && responseText.trim()) {
         setResponseText(responseText + " " + transcript);
       } else {
@@ -343,9 +342,11 @@ function ParticipantRoom({ room, onLeave }) {
     }
   };
 
-  // Handle candidate response submission - FIXED
-  const handleCandidateResponse = async (response) => {
-    if (!response.trim()) {
+  // Handle candidate response submission - COMPLETELY REWRITTEN FOR RELIABILITY
+  const handleCandidateResponse = useCallback(async (response) => {
+    const trimmedResponse = response?.trim();
+    
+    if (!trimmedResponse) {
       console.warn('⚠️ Cannot submit empty response');
       addMessage("⚠️ Please provide an answer before submitting.", 'system', new Date().toISOString());
       return;
@@ -399,14 +400,13 @@ function ParticipantRoom({ room, onLeave }) {
     }
     
     try {
-      console.log('📝 Processing candidate response:', response.substring(0, 100));
-      console.log('📝 Current question:', currentQuestion.substring(0, 100));
+      console.log('📝 Processing candidate response of length:', trimmedResponse.length);
       console.log('📝 Session ID:', currentSessionId);
       
-      // Add answer to chat
-      addMessage(response, 'participant', new Date().toISOString());
+      // Add answer to chat for visual feedback
+      addMessage(trimmedResponse, 'participant', new Date().toISOString());
       
-      // Clear response text
+      // Clear response text input
       setResponseText("");
       
       // Set status to analyzing
@@ -423,20 +423,29 @@ function ParticipantRoom({ room, onLeave }) {
         body: JSON.stringify({
           session_id: currentSessionId,
           question: currentQuestion,
-          answer: response
+          answer: trimmedResponse
         })
       });
       
       if (!submitResponse.ok) {
         const errorText = await submitResponse.text();
         console.error('❌ API submission failed:', errorText);
-        throw new Error(`HTTP ${submitResponse.status}: ${errorText.substring(0, 200)}`);
+        
+        let errorMessage = `HTTP ${submitResponse.status}`;
+        try {
+          const errorData = JSON.parse(errorText);
+          errorMessage = errorData.message || errorData.error || errorText;
+        } catch {
+          errorMessage = errorText || submitResponse.statusText;
+        }
+        
+        throw new Error(errorMessage.substring(0, 200));
       }
       
       const result = await submitResponse.json();
       console.log('✅ Answer submitted, result:', result);
       
-      // Show feedback
+      // Show feedback score
       if (result.score !== undefined) {
         const feedbackMessage = `📊 Score: ${result.score}/10 - ${result.feedback || 'Good response!'}`;
         setResponseAnalysis({ score: result.score, feedback: result.feedback });
@@ -447,10 +456,8 @@ function ParticipantRoom({ room, onLeave }) {
       if (result.next_question) {
         console.log('📝 Next question received:', result.next_question);
         
-        // Update status to speaking for next question
         setAiInterviewerStatus("speaking");
         
-        // Show next question after delay
         setTimeout(() => {
           setCurrentQuestion(result.next_question);
           addMessage(result.next_question, 'ai_interviewer', new Date().toISOString());
@@ -458,20 +465,19 @@ function ParticipantRoom({ room, onLeave }) {
           
           // Play TTS for next question
           if (voiceEnabled && 'speechSynthesis' in window) {
+            window.speechSynthesis.cancel();
+            
             const utterance = new SpeechSynthesisUtterance(result.next_question);
             utterance.rate = 0.95;
             utterance.pitch = 1.0;
             utterance.volume = 1.0;
             utterance.lang = 'en-US';
             
-            // Get available voices
             const voices = window.speechSynthesis.getVoices();
             const preferredVoice = voices.find(voice => 
               voice.lang === 'en-US' && !voice.name.includes('Microsoft') && voice.name.includes('Google')
             ) || voices.find(voice => voice.lang === 'en-US');
-            if (preferredVoice) {
-              utterance.voice = preferredVoice;
-            }
+            if (preferredVoice) utterance.voice = preferredVoice;
             
             utterance.onstart = () => {
               setAiInterviewerStatus("speaking");
@@ -491,7 +497,6 @@ function ParticipantRoom({ room, onLeave }) {
             
             window.speechSynthesis.speak(utterance);
           } else {
-            // If TTS not available, just switch to listening after delay
             setTimeout(() => {
               setAiInterviewerStatus("listening");
               setIsListeningForResponse(true);
@@ -508,7 +513,6 @@ function ParticipantRoom({ room, onLeave }) {
         const finalMessage = `🎉 AI Interview Completed! Final Score: ${result.final_results?.percentage || result.percentage || 'N/A'}%`;
         addMessage(finalMessage, 'system', new Date().toISOString());
         
-        // Stop AI interviewer after completion
         setTimeout(() => {
           setCurrentQuestion("");
           setAiInterviewerActive(false);
@@ -516,14 +520,12 @@ function ParticipantRoom({ room, onLeave }) {
         }, 5000);
         
       } else {
-        // No next question but not complete - request one
         console.warn('⚠️ No next question provided, requesting...');
         addMessage("🔄 Loading next question...", 'system', new Date().toISOString());
         
         setTimeout(() => {
           if (aiInterviewerActive) {
             requestAIQuestion();
-            // Set to listening while waiting
             setAiInterviewerStatus("listening");
             setIsListeningForResponse(true);
           }
@@ -533,13 +535,12 @@ function ParticipantRoom({ room, onLeave }) {
     } catch (error) {
       console.error('❌ Error handling candidate response:', error);
       addMessage(`❌ Error sending response: ${error.message}`, 'system', new Date().toISOString());
-      // Reset to listening state on error
       setAiInterviewerStatus("listening");
       setIsListeningForResponse(true);
     } finally {
       setIsResponding(false);
     }
-  };
+  }, [aiInterviewerActive, currentQuestion, currentSessionId, aiInterviewerStatus, isResponding, responseTimeout, recognition, voiceEnabled]);
 
   const requestAIQuestion = () => {
     if (!aiInterviewerActive || !currentSessionId) {
@@ -549,7 +550,6 @@ function ParticipantRoom({ room, onLeave }) {
     
     console.log('📥 Requesting AI question from backend...');
     
-    // Request via REST API
     fetch(`${PYTHON_API_URL}/start_ai_interview`, {
       method: "POST",
       headers: { 'Content-Type': 'application/json' },
@@ -829,7 +829,6 @@ function ParticipantRoom({ room, onLeave }) {
               break;
               
             case 'detection':
-              // Handle detection results silently
               if (data.faces !== undefined) {
                 console.log('🔍 Detection update:', data.faces, 'faces,', data.gender);
               }

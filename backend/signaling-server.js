@@ -2,19 +2,20 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 
-// Server Configuration - UPDATED with better heartbeat intervals
+// Server Configuration - UPDATED with improved heartbeat and reconnection handling
 const SERVER_CONFIG = {
   MAX_FILE_SIZE: 50 * 1024 * 1024,
   MAX_IN_MEMORY_FILE_SIZE: 5 * 1024 * 1024,
-  HEARTBEAT_INTERVAL: 25000, // REDUCED from 45000 to 25 seconds for better responsiveness
-  HEARTBEAT_TIMEOUT: 10000, // REDUCED from 15000 to 10 seconds
+  HEARTBEAT_INTERVAL: 30000, // 30 seconds for heartbeat
+  HEARTBEAT_TIMEOUT: 15000, // 15 seconds to wait for pong
   CLEANUP_INTERVAL: 60000, // 60 seconds
   MAX_ROOMS: 100,
   MAX_CLIENTS_PER_ROOM: 50,
   MAX_MESSAGES_HISTORY: 100,
   FILE_RETENTION_MINUTES: 60,
-  ICE_GATHERING_TIMEOUT: 10000, // 10 seconds for ICE gathering
-  CONNECTION_TIMEOUT: 30000 // 30 seconds for connection establishment
+  ICE_GATHERING_TIMEOUT: 10000,
+  CONNECTION_TIMEOUT: 30000,
+  RECONNECT_GRACE_PERIOD: 10000 // 10 seconds for reconnection
 };
 
 const wss = new WebSocket.Server({ 
@@ -46,6 +47,7 @@ const clients = new Map();
 let clientIdCounter = 0;
 const fileMetadata = new Map();
 const roomLocks = new Map();
+const reconnectAttempts = new Map();
 
 // Track connection timeouts
 const connectionTimeouts = new Map();
@@ -221,11 +223,14 @@ async function handleJoin(ws, message, clientId) {
         participants: [],
         messages: [],
         files: [],
-        iceCandidates: [] // Store pending ICE candidates
+        iceCandidates: [],
+        lastActivity: Date.now()
       };
       rooms.set(room, roomData);
       console.log(`🏠 New room created: ${room}`);
     }
+
+    roomData.lastActivity = Date.now();
 
     if (roomData.clients.length >= SERVER_CONFIG.MAX_CLIENTS_PER_ROOM) {
       safeSend(ws, { 
@@ -357,6 +362,8 @@ function handleWebRTCMessage(senderWs, message, senderId) {
     return;
   }
 
+  roomData.lastActivity = Date.now();
+
   console.log(`🔄 Forwarding ${message.type} from ${client.role} ${senderId} in room ${client.room}`);
 
   let targetClients = [];
@@ -450,6 +457,8 @@ function handleChatMessage(senderWs, message, senderId) {
   const roomData = rooms.get(client.room);
   if (!roomData) return;
 
+  roomData.lastActivity = Date.now();
+
   const messageText = message.message || message.text;
   if (!messageText || messageText.trim() === '') return;
 
@@ -500,6 +509,8 @@ function handleScreenShareState(senderWs, message, senderId) {
 
   const roomData = rooms.get(client.room);
   if (!roomData) return;
+
+  roomData.lastActivity = Date.now();
 
   const isSharing = Boolean(message.isSharing);
 
@@ -588,6 +599,11 @@ async function handleLeaveRoom(ws, roomId) {
     }
 
     console.log(`🚪 ${client.role} ${client.id} explicitly left room ${roomId}`);
+    
+    if (roomData.clients.length === 0) {
+      rooms.delete(roomId);
+      console.log(`🏚️ Room ${roomId} deleted after client left`);
+    }
   });
 }
 
@@ -609,7 +625,8 @@ function logRoomStatus(roomId) {
       .map(p => ({ id: p.id, userId: p.userId })),
     messageHistoryCount: roomData.messages.length,
     fileCount: roomData.files.length,
-    createdAt: roomData.createdAt
+    createdAt: roomData.createdAt,
+    lastActivity: new Date(roomData.lastActivity).toISOString()
   };
   
   console.log('📊 Room Status:', JSON.stringify(status, null, 2));
@@ -696,7 +713,8 @@ wss.on('connection', (ws, req) => {
                   interviewer: !!roomData.interviewer,
                   participants: roomData.participants.length,
                   files: roomData.files.length,
-                  createdAt: roomData.createdAt
+                  createdAt: roomData.createdAt,
+                  lastActivity: roomData.lastActivity
                 },
                 timestamp: Date.now()
               });
@@ -714,6 +732,12 @@ wss.on('connection', (ws, req) => {
                 participantId: clientId,
                 userId: client.userId,
                 timestamp: Date.now()
+              });
+            } else {
+              console.warn(`⚠️ No interviewer available to handle offer request`);
+              safeSend(ws, {
+                type: 'error',
+                message: 'No interviewer available to process offer request'
               });
             }
           }
@@ -733,13 +757,13 @@ wss.on('connection', (ws, req) => {
     connectionTimeouts.delete(ws);
     const client = clients.get(ws);
     if (client) {
-      console.log(`🔌 Client ${client.id} disconnected (code: ${code})`);
+      console.log(`🔌 Client ${client.id} disconnected (code: ${code}, reason: ${reason || 'no reason'})`);
       handleDisconnect(ws);
     }
   });
 
   ws.on('error', (error) => {
-    console.error(`❌ WebSocket error for client ${clientId}:`, error);
+    console.error(`❌ WebSocket error for client ${clientId}:`, error.message);
     clearTimeout(connectionTimeouts.get(ws));
     connectionTimeouts.delete(ws);
     handleDisconnect(ws);
@@ -751,7 +775,7 @@ wss.on('connection', (ws, req) => {
     clientId: clientId,
     timestamp: Date.now(),
     serverInfo: {
-      version: '2.0.1',
+      version: '2.1.0',
       uptime: process.uptime(),
       totalRooms: rooms.size,
       totalClients: clients.size,
@@ -760,10 +784,11 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Periodic cleanup
+// Periodic cleanup - improved with last activity tracking
 setInterval(() => {
   let cleanedClients = 0;
   let cleanedRooms = 0;
+  const now = Date.now();
   
   // Clean dead clients
   clients.forEach((client, ws) => {
@@ -773,31 +798,54 @@ setInterval(() => {
     }
   });
   
-  // Clean empty rooms
+  // Clean empty rooms and inactive rooms (no activity for 5 minutes)
   rooms.forEach((roomData, roomId) => {
     const activeClients = roomData.clients.filter(c => c.ws.readyState === WebSocket.OPEN);
+    
+    // Delete empty rooms
     if (activeClients.length === 0) {
       rooms.delete(roomId);
       cleanedRooms++;
       roomLocks.delete(roomId);
-    } else {
-      roomData.clients = activeClients;
-      roomData.participants = roomData.participants.filter(p => p.ws.readyState === WebSocket.OPEN);
-      if (roomData.interviewer && roomData.interviewer.ws.readyState !== WebSocket.OPEN) {
-        roomData.interviewer = null;
-      }
+    } 
+    // Also delete rooms with no activity for 10 minutes (optional cleanup)
+    else if (roomData.lastActivity && (now - roomData.lastActivity) > 600000) {
+      console.log(`🧹 Cleaning inactive room ${roomId} (no activity for 10 minutes)`);
+      // Notify clients before closing
+      roomData.clients.forEach(client => {
+        if (client.ws.readyState === WebSocket.OPEN) {
+          safeSend(client.ws, {
+            type: 'room_closing',
+            message: 'Room closing due to inactivity',
+            room: roomId,
+            timestamp: Date.now()
+          });
+        }
+      });
+      rooms.delete(roomId);
+      cleanedRooms++;
+      roomLocks.delete(roomId);
     }
   });
   
   if (cleanedClients > 0 || cleanedRooms > 0) {
-    console.log(`🧹 Cleaned up ${cleanedClients} dead clients, ${cleanedRooms} empty rooms`);
+    console.log(`🧹 Cleaned up ${cleanedClients} dead clients, ${cleanedRooms} inactive rooms`);
+    console.log(`📊 Current stats: ${rooms.size} rooms, ${clients.size} clients`);
   }
 }, SERVER_CONFIG.CLEANUP_INTERVAL);
+
+// Periodic stats logging
+setInterval(() => {
+  if (rooms.size > 0 || clients.size > 0) {
+    console.log(`📊 Server Stats: ${rooms.size} active rooms, ${clients.size} connected clients`);
+  }
+}, 60000); // Log every minute
 
 // Graceful shutdown
 const gracefulShutdown = (signal) => {
   console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
   
+  // Close all client connections
   clients.forEach((client, ws) => {
     if (ws.readyState === WebSocket.OPEN) {
       try {
@@ -809,12 +857,13 @@ const gracefulShutdown = (signal) => {
     }
   });
   
+  // Allow time for messages to be sent
   setTimeout(() => {
     wss.close(() => {
       console.log('✅ Signaling server shut down');
       process.exit(0);
     });
-  }, 1000);
+  }, 2000);
 };
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
@@ -824,8 +873,10 @@ console.log('\n✅ WebRTC Signaling Server ready!');
 console.log('='.repeat(50));
 console.log('📋 Server Information:');
 console.log(`   - Endpoint: ws://localhost:8082`);
+console.log(`   - Version: 2.1.0`);
 console.log(`   - Max file size: ${SERVER_CONFIG.MAX_FILE_SIZE / (1024 * 1024)}MB`);
 console.log(`   - Heartbeat interval: ${SERVER_CONFIG.HEARTBEAT_INTERVAL / 1000} seconds`);
 console.log(`   - Heartbeat timeout: ${SERVER_CONFIG.HEARTBEAT_TIMEOUT / 1000} seconds`);
 console.log(`   - Connection timeout: ${SERVER_CONFIG.CONNECTION_TIMEOUT / 1000} seconds`);
+console.log(`   - Cleanup interval: ${SERVER_CONFIG.CLEANUP_INTERVAL / 1000} seconds`);
 console.log('='.repeat(50));

@@ -29,6 +29,7 @@ function ParticipantAIInterviewQA({
   const [showTips, setShowTips] = useState(true);
   const [hasSpokenQuestion, setHasSpokenQuestion] = useState(false);
   const [answerSubmitted, setAnswerSubmitted] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
@@ -79,6 +80,7 @@ function ParticipantAIInterviewQA({
     if (!isResponding && localResponding) {
       setLocalResponding(false);
       setAnswerSubmitted(false);
+      setIsSubmitting(false);
     }
   }, [isResponding, localResponding]);
   
@@ -95,6 +97,7 @@ function ParticipantAIInterviewQA({
     setHasSpokenQuestion(false);
     setAnswerSubmitted(false);
     setLocalResponding(false);
+    setIsSubmitting(false);
     // Clear any pending submit timeout
     if (submitTimeoutRef.current) {
       clearTimeout(submitTimeoutRef.current);
@@ -163,7 +166,7 @@ function ParticipantAIInterviewQA({
   
   // Start voice recording
   const startRecording = async () => {
-    if (disabled || aiInterviewerStatus !== 'listening') {
+    if (disabled || aiInterviewerStatus !== 'listening' || answerSubmitted || isSubmitting) {
       const statusMessages = {
         'speaking': 'Please wait for AI to finish speaking before recording.',
         'analyzing': 'AI is analyzing your previous answer. Please wait.',
@@ -259,6 +262,9 @@ function ParticipantAIInterviewQA({
         if (onVoiceTranscript) {
           onVoiceTranscript(transcribedText);
         }
+        
+        // Auto-submit after successful transcription (optional)
+        // setTimeout(() => handleSubmit(), 500);
       } else {
         setTranscriptionError(result.error || 'Failed to transcribe audio');
       }
@@ -278,7 +284,7 @@ function ParticipantAIInterviewQA({
       
       console.log('📤 Ctrl+Enter pressed - attempting submit');
       
-      if (!disabled && answer?.trim() && !isResponding && !localResponding && aiInterviewerStatus === 'listening' && !answerSubmitted) {
+      if (!disabled && answer?.trim() && !isResponding && !localResponding && !isSubmitting && aiInterviewerStatus === 'listening' && !answerSubmitted) {
         console.log('📤 Ctrl+Enter - conditions met, calling submit');
         handleSubmit();
       } else {
@@ -287,6 +293,7 @@ function ParticipantAIInterviewQA({
           hasAnswer: !!answer?.trim(),
           isResponding,
           localResponding,
+          isSubmitting,
           aiInterviewerStatus,
           answerSubmitted
         });
@@ -310,6 +317,12 @@ function ParticipantAIInterviewQA({
     if (answerSubmitted) {
       console.log('⚠️ Submit blocked: Answer already submitted for this question');
       alert("Your answer has already been submitted. Waiting for AI response...");
+      return;
+    }
+    
+    // Prevent submission if already submitting
+    if (isSubmitting) {
+      console.log('⚠️ Submit blocked: Already submitting');
       return;
     }
     
@@ -351,6 +364,7 @@ function ParticipantAIInterviewQA({
     setSubmitAttempts(prev => prev + 1);
     setLocalResponding(true);
     setAnswerSubmitted(true);
+    setIsSubmitting(true);
     
     // Clear any pending submit timeout
     if (submitTimeoutRef.current) {
@@ -359,11 +373,20 @@ function ParticipantAIInterviewQA({
     }
     
     // Call the onSubmit prop from parent
-    onSubmit();
+    try {
+      onSubmit();
+    } catch (error) {
+      console.error('❌ Error in onSubmit:', error);
+      setAnswerSubmitted(false);
+      setLocalResponding(false);
+      setIsSubmitting(false);
+      alert("Failed to submit answer. Please try again.");
+    }
     
     // Reset local responding after a delay (fallback in case parent doesn't reset)
-    setTimeout(() => {
+    submitTimeoutRef.current = setTimeout(() => {
       setLocalResponding(false);
+      setIsSubmitting(false);
     }, 15000);
   };
   
@@ -410,20 +433,21 @@ function ParticipantAIInterviewQA({
     !answer?.trim() || 
     isResponding || 
     localResponding ||
-    answerSubmitted;
+    answerSubmitted ||
+    isSubmitting;
   
   // Determine if textarea should be disabled
-  const isTextareaDisabled = aiInterviewerStatus !== 'listening' || disabled || isResponding || answerSubmitted;
+  const isTextareaDisabled = aiInterviewerStatus !== 'listening' || disabled || isResponding || answerSubmitted || isSubmitting;
   
   // Determine if voice recording should be disabled
-  const isVoiceDisabled = disabled || aiInterviewerStatus !== 'listening' || isResponding || localResponding || answerSubmitted;
+  const isVoiceDisabled = disabled || aiInterviewerStatus !== 'listening' || isResponding || localResponding || answerSubmitted || isSubmitting;
   
   // Determine if textarea is enabled
-  const isTextareaEnabled = aiInterviewerStatus === 'listening' && !isResponding && !disabled && !answerSubmitted;
+  const isTextareaEnabled = aiInterviewerStatus === 'listening' && !isResponding && !disabled && !answerSubmitted && !isSubmitting;
   
   // Get appropriate placeholder text
   const getPlaceholderText = () => {
-    if (answerSubmitted) {
+    if (answerSubmitted || isSubmitting) {
       return "✓ Answer submitted! Waiting for AI response...";
     } else if (aiInterviewerStatus === 'listening') {
       return "🎤 AI is listening! Type your answer here. Press Ctrl+Enter to submit.";
@@ -549,14 +573,14 @@ function ParticipantAIInterviewQA({
         <div className="participant-section-label">
           <span className="participant-label-icon">💬</span>
           Your Response
-          {aiInterviewerStatus === 'listening' && !answerSubmitted && (
+          {aiInterviewerStatus === 'listening' && !answerSubmitted && !isSubmitting && (
             <span className="listening-badge" style={{ backgroundColor: '#27ae60', color: 'white', padding: '2px 8px', borderRadius: '12px', marginLeft: '10px', fontSize: '11px' }}>
               🎤 Ready for your answer
             </span>
           )}
-          {answerSubmitted && (
+          {(answerSubmitted || isSubmitting) && (
             <span className="submitted-badge" style={{ backgroundColor: '#4caf50', color: 'white', padding: '2px 8px', borderRadius: '12px', marginLeft: '10px', fontSize: '11px' }}>
-              ✓ Answer Submitted
+              {isSubmitting ? '⏳ Sending...' : '✓ Answer Submitted'}
             </span>
           )}
         </div>
@@ -569,7 +593,7 @@ function ParticipantAIInterviewQA({
                 type="button"
                 onClick={startRecording}
                 disabled={isVoiceDisabled || isTranscribing}
-                className={`voice-record-button ${aiInterviewerStatus === 'listening' && !isResponding && !localResponding && !answerSubmitted ? 'ready' : ''}`}
+                className={`voice-record-button ${aiInterviewerStatus === 'listening' && !isResponding && !localResponding && !answerSubmitted && !isSubmitting ? 'ready' : ''}`}
                 style={{
                   opacity: (isVoiceDisabled || isTranscribing) ? 0.5 : 1,
                   cursor: (isVoiceDisabled || isTranscribing) ? 'not-allowed' : 'pointer'
@@ -594,7 +618,7 @@ function ParticipantAIInterviewQA({
                 ⚠️ {transcriptionError}
               </div>
             )}
-            {voiceEnabled && aiInterviewerStatus === 'listening' && !isRecording && !isTranscribing && !isResponding && !localResponding && !answerSubmitted && (
+            {voiceEnabled && aiInterviewerStatus === 'listening' && !isRecording && !isTranscribing && !isResponding && !localResponding && !answerSubmitted && !isSubmitting && (
               <div className="voice-hint">
                 💡 Click the microphone to record your answer, or type below
               </div>
@@ -645,7 +669,7 @@ function ParticipantAIInterviewQA({
                   cursor: !isSubmitDisabled ? 'pointer' : 'not-allowed'
                 }}
               >
-                {(isResponding || localResponding) ? (
+                {(isResponding || localResponding || isSubmitting) ? (
                   <>
                     <span className="participant-submit-spinner"></span>
                     Sending...
