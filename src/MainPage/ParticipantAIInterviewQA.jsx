@@ -27,6 +27,8 @@ function ParticipantAIInterviewQA({
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcriptionError, setTranscriptionError] = useState(null);
   const [showTips, setShowTips] = useState(true);
+  const [liveTranscript, setLiveTranscript] = useState(''); // real-time interim text
+  const [useWebSpeech, setUseWebSpeech] = useState(false); // whether browser supports Web Speech API
 
   const [answerSubmitted, setAnswerSubmitted] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -38,7 +40,17 @@ function ParticipantAIInterviewQA({
   const streamRef = useRef(null);
   const currentUtteranceRef = useRef(null);
   const submitTimeoutRef = useRef(null);
+  const speechRecognitionRef = useRef(null); // Web Speech API instance
+  const interimAnswerRef = useRef('');       // accumulated answer before session ends
   
+  // Detect Web Speech API support on mount
+  useEffect(() => {
+    const SpeechRecognitionAPI =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    setUseWebSpeech(!!SpeechRecognitionAPI);
+    console.log('🎤 Web Speech API available:', !!SpeechRecognitionAPI);
+  }, []);
+
   // Debug logging for status changes
   useEffect(() => {
     console.log('🔍 ParticipantAIInterviewQA - Status:', {
@@ -113,6 +125,10 @@ function ParticipantAIInterviewQA({
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
+      if (speechRecognitionRef.current) {
+        try { speechRecognitionRef.current.stop(); } catch (_) {}
+        speechRecognitionRef.current = null;
+      }
       if (window.speechSynthesis) {
         window.speechSynthesis.cancel();
       }
@@ -121,10 +137,190 @@ function ParticipantAIInterviewQA({
   
 
   
-  // Start voice recording
+  // ─── PRIMARY: Web Speech API (real-time, no backend needed) ───────────────
+  const startWebSpeechRecording = () => {
+    const SpeechRecognitionAPI =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognitionAPI) return false;
+
+    setTranscriptionError(null);
+    setLiveTranscript('');
+    interimAnswerRef.current = answer?.trim() || '';
+
+    const recognition = new SpeechRecognitionAPI();
+    recognition.lang = 'en-US';
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+    recognition.continuous = true;
+
+    recognition.onresult = (event) => {
+      let interim = '';
+      let finalText = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalText += transcript + ' ';
+        } else {
+          interim += transcript;
+        }
+      }
+
+      if (finalText) {
+        interimAnswerRef.current = (interimAnswerRef.current + ' ' + finalText).trim();
+        setAnswer(interimAnswerRef.current);
+        if (onVoiceTranscript) onVoiceTranscript(finalText.trim());
+      }
+      setLiveTranscript(interim);
+    };
+
+    recognition.onerror = (event) => {
+      console.error('Speech recognition error:', event.error);
+      setIsRecording(false);
+      setLiveTranscript('');
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      speechRecognitionRef.current = null;
+
+      if (event.error === 'no-speech') {
+        // Benign – user just didn't speak; don't fall back
+        setTranscriptionError('No speech detected. Please speak clearly and try again.');
+      } else if (event.error === 'not-allowed') {
+        setTranscriptionError('Microphone permission denied. Please allow microphone access in your browser settings.');
+      } else if (event.error === 'network' || event.error === 'service-not-allowed') {
+        // Google's servers unreachable (HTTP, no internet, corp firewall, etc.)
+        // Auto-fallback to MediaRecorder + local backend
+        console.warn('⚠️ Web Speech API unavailable (network). Falling back to MediaRecorder...');
+        setUseWebSpeech(false); // disable for future clicks too
+        setTranscriptionError(null);
+        // Start MediaRecorder immediately
+        startMediaRecording();
+      } else {
+        // Unknown error – also fall back to MediaRecorder
+        console.warn(`⚠️ Web Speech API error (${event.error}). Falling back to MediaRecorder...`);
+        setUseWebSpeech(false);
+        setTranscriptionError(null);
+        startMediaRecording();
+      }
+    };
+
+    recognition.onend = () => {
+      console.log('🎤 Speech recognition ended');
+      setIsRecording(false);
+      setLiveTranscript('');
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    };
+
+    speechRecognitionRef.current = recognition;
+    recognition.start();
+    setIsRecording(true);
+    setRecordingTime(0);
+    timerRef.current = setInterval(() => setRecordingTime(prev => prev + 1), 1000);
+    console.log('🎤 Web Speech API recording started');
+    return true;
+  };
+
+  const stopWebSpeechRecording = () => {
+    if (speechRecognitionRef.current) {
+      try { speechRecognitionRef.current.stop(); } catch (_) {}
+      speechRecognitionRef.current = null;
+    }
+    setIsRecording(false);
+    setLiveTranscript('');
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+  };
+
+  // ─── FALLBACK: MediaRecorder + backend /transcribe ─────────────────────────
+  const startMediaRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : 'audio/mp4';
+
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) audioChunksRef.current.push(event.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        const ext = mimeType.includes('mp4') ? '.mp4' : '.webm';
+        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
+        await transcribeWithBackend(audioBlob, ext);
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop());
+          streamRef.current = null;
+        }
+      };
+
+      mediaRecorder.start(100);
+      setIsRecording(true);
+      setRecordingTime(0);
+      timerRef.current = setInterval(() => setRecordingTime(prev => prev + 1), 1000);
+      console.log('🎙️ MediaRecorder fallback started');
+    } catch (err) {
+      console.error('Microphone access error:', err);
+      setTranscriptionError('Could not access microphone. Please check permissions.');
+    }
+  };
+
+  const stopMediaRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    }
+  };
+
+  const transcribeWithBackend = async (blob, ext = '.webm') => {
+    setIsTranscribing(true);
+    try {
+      const formData = new FormData();
+      formData.append('audio', blob, `recording${ext}`);
+
+      const response = await fetch('http://localhost:8001/transcribe', {
+        method: 'POST',
+        body: formData,
+        signal: AbortSignal.timeout(30000)
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Server error ${response.status}`);
+      }
+
+      const result = await response.json();
+
+      if (result.success && result.text) {
+        const transcribedText = result.text.trim();
+        setAnswer(prev => prev?.trim() ? prev.trim() + ' ' + transcribedText : transcribedText);
+        if (onVoiceTranscript) onVoiceTranscript(transcribedText);
+        console.log(`✅ Backend transcription (${result.engine}): ${transcribedText.substring(0, 60)}`);
+      } else {
+        setTranscriptionError(result.error || 'Failed to transcribe audio. Please type your answer.');
+      }
+    } catch (err) {
+      console.error('Backend transcription error:', err);
+      if (err.name === 'TimeoutError') {
+        setTranscriptionError('Transcription timed out. Please type your answer manually.');
+      } else {
+        setTranscriptionError(`Transcription failed: ${err.message}. Please type your answer.`);
+      }
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  // ─── Unified start/stop (picks the right engine) ──────────────────────────
   const startRecording = async () => {
     const readyStatuses = ['listening', 'idle', 'connected', 'speaking'];
-    if (disabled || !readyStatuses.includes(aiInterviewerStatus) || answerSubmitted || isSubmitting) {
+    if (disabled || answerSubmitted || isSubmitting) return;
+    if (!readyStatuses.includes(aiInterviewerStatus)) {
       if (aiInterviewerStatus === 'analyzing') {
         alert('AI is analyzing your previous answer. Please wait.');
         return;
@@ -133,107 +329,30 @@ function ParticipantAIInterviewQA({
         alert('Interview is complete. Thank you for participating!');
         return;
       }
-      // If idle/connected/speaking but we have a question, allow it
       if (!question && aiInterviewerStatus === 'idle') {
         alert('AI Interviewer is not active. Please wait for a question.');
         return;
       }
     }
-    
+
     setTranscriptionError(null);
     setRecordingTime(0);
-    
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4'
-      });
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-      
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-      
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { 
-          type: mediaRecorder.mimeType || 'audio/webm' 
-        });
-        await transcribeAudio(audioBlob);
-        
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach(track => track.stop());
-          streamRef.current = null;
-        }
-      };
-      
-      mediaRecorder.start(100);
-      setIsRecording(true);
-      setRecordingTime(0);
-      
-      timerRef.current = setInterval(() => {
-        setRecordingTime(prev => prev + 1);
-      }, 1000);
-      
-    } catch (err) {
-      console.error('Error accessing microphone:', err);
-      alert('Could not access microphone. Please check permissions and try again.');
+
+    // Prefer Web Speech API (no latency, no backend call)
+    if (useWebSpeech) {
+      const started = startWebSpeechRecording();
+      if (started) return;
     }
+
+    // Fallback to MediaRecorder + backend
+    await startMediaRecording();
   };
-  
-  // Stop recording
+
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-    }
-  };
-  
-  // Transcribe audio to text
-  const transcribeAudio = async (blob) => {
-    setIsTranscribing(true);
-    
-    try {
-      const formData = new FormData();
-      formData.append('audio', blob, 'recording.webm');
-      
-      const response = await fetch('http://localhost:8001/transcribe', {
-        method: 'POST',
-        body: formData,
-        signal: AbortSignal.timeout(15000) // 15 second timeout
-      });
-      
-      const result = await response.json();
-      
-      if (result.success && result.text) {
-        const transcribedText = result.text;
-        
-        if (answer && answer.trim()) {
-          setAnswer(answer + " " + transcribedText);
-        } else {
-          setAnswer(transcribedText);
-        }
-        
-        if (onVoiceTranscript) {
-          onVoiceTranscript(transcribedText);
-        }
-      } else {
-        setTranscriptionError(result.error || 'Failed to transcribe audio');
-      }
-    } catch (err) {
-      console.error('Transcription error:', err);
-      setTranscriptionError('Network error. Please type your answer.');
-    } finally {
-      setIsTranscribing(false);
+    if (useWebSpeech && speechRecognitionRef.current) {
+      stopWebSpeechRecording();
+    } else {
+      stopMediaRecording();
     }
   };
   
@@ -592,19 +711,46 @@ function ParticipantAIInterviewQA({
                 }}
               >
                 <span className="voice-icon">🎤</span>
-                {isTranscribing ? 'Transcribing...' : 'Record Voice Answer'}
+                {isTranscribing
+                  ? 'Transcribing...'
+                  : useWebSpeech
+                    ? 'Record Voice Answer (Live)'
+                    : 'Record Voice Answer'}
               </button>
             ) : (
               <div className="recording-controls">
                 <div className="recording-indicator">
                   <span className="recording-dot"></span>
                   <span className="recording-time">{formatTime(recordingTime)}</span>
+                  {useWebSpeech && (
+                    <span style={{ fontSize: '11px', marginLeft: '8px', color: '#27ae60' }}>
+                      🟢 Live transcription
+                    </span>
+                  )}
                 </div>
                 <button onClick={stopRecording} className="stop-record-button">
                   ⏹️ Stop Recording
                 </button>
               </div>
             )}
+
+            {/* Live interim transcript (Web Speech API only) */}
+            {isRecording && liveTranscript && (
+              <div style={{
+                marginTop: '8px',
+                padding: '8px 12px',
+                background: 'rgba(39,174,96,0.08)',
+                border: '1px dashed #27ae60',
+                borderRadius: '8px',
+                fontSize: '13px',
+                color: '#555',
+                fontStyle: 'italic'
+              }}>
+                🎙️ <em>{liveTranscript}</em>
+              </div>
+            )}
+
+            {/* Transcription error */}
             {transcriptionError && (
               <div className="transcription-error">
                 ⚠️ {transcriptionError}
@@ -616,9 +762,12 @@ function ParticipantAIInterviewQA({
                 </button>
               </div>
             )}
+
             {voiceEnabled && aiInterviewerStatus === 'listening' && !isRecording && !isTranscribing && !isResponding && !isSubmitting && (
               <div className="voice-hint">
-                💡 Click the microphone to record your answer, or type below
+                💡 {useWebSpeech
+                  ? 'Click the microphone — text appears live as you speak!'
+                  : 'Click the microphone to record your answer, or type below'}
               </div>
             )}
           </div>

@@ -76,6 +76,28 @@ except ImportError:
     PDF_AVAILABLE = False
     logger.warning("PyPDF2 not available - PDF parsing disabled")
 
+# Import speech-to-text libraries
+WHISPER_AVAILABLE = False
+SPEECH_RECOGNITION_AVAILABLE = False
+
+try:
+    import whisper as whisper_lib
+    import tempfile
+    import subprocess
+    _whisper_model = None  # Lazy-load on first use
+    WHISPER_AVAILABLE = True
+    logger.info("OpenAI Whisper loaded")
+except ImportError:
+    logger.warning("Whisper not available - trying SpeechRecognition")
+
+try:
+    import speech_recognition as sr
+    import tempfile
+    SPEECH_RECOGNITION_AVAILABLE = True
+    logger.info("SpeechRecognition loaded")
+except ImportError:
+    logger.warning("SpeechRecognition not available - transcription disabled")
+
 # Create FastAPI app
 app = FastAPI(title="Fraud Detection & AI Interview", version="1.3.0")
 
@@ -742,6 +764,141 @@ async def health():
     }
 
 
+@app.post("/transcribe")
+async def transcribe_audio(request: Request):
+    """
+    Transcribe uploaded audio to text.
+    Accepts multipart/form-data with field 'audio'.
+    Tries Whisper first, falls back to Google SpeechRecognition.
+    """
+    global _whisper_model
+
+    if not WHISPER_AVAILABLE and not SPEECH_RECOGNITION_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "error": "No transcription engine available. Install openai-whisper or speechrecognition."}
+        )
+
+    try:
+        form = await request.form()
+        audio_file = form.get("audio")
+
+        if audio_file is None:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "No audio field in form data"}
+            )
+
+        audio_bytes = await audio_file.read()
+        if not audio_bytes:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "Empty audio data"}
+            )
+
+        filename = getattr(audio_file, 'filename', 'recording.webm') or 'recording.webm'
+        ext = os.path.splitext(filename)[1].lower() or '.webm'
+
+        logger.info(f"Transcribe request: {len(audio_bytes)} bytes, ext={ext}")
+
+        # ── Try Whisper ──────────────────────────────────────────
+        if WHISPER_AVAILABLE:
+            try:
+                if _whisper_model is None:
+                    logger.info("Loading Whisper 'base' model (first use)...")
+                    _whisper_model = whisper_lib.load_model("base")
+                    logger.info("Whisper model loaded")
+
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = tmp.name
+
+                try:
+                    result = _whisper_model.transcribe(tmp_path, language="en")
+                    text = result.get("text", "").strip()
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+
+                if text:
+                    logger.info(f"Whisper transcript ({len(text)} chars): {text[:80]}")
+                    return {"success": True, "text": text, "engine": "whisper"}
+                else:
+                    logger.warning("Whisper returned empty text")
+
+            except Exception as e:
+                logger.error(f"Whisper transcription failed: {e}")
+
+        # ── Fallback: SpeechRecognition (Google) ─────────────────
+        if SPEECH_RECOGNITION_AVAILABLE:
+            try:
+                import tempfile
+                recognizer = sr.Recognizer()
+
+                # SpeechRecognition needs WAV; convert if needed
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_src:
+                    tmp_src.write(audio_bytes)
+                    src_path = tmp_src.name
+
+                wav_path = src_path
+                converted = False
+
+                if ext != '.wav':
+                    wav_path = src_path.replace(ext, '.wav')
+                    try:
+                        # Try ffmpeg conversion
+                        result = subprocess.run(
+                            ['ffmpeg', '-y', '-i', src_path, '-ar', '16000', '-ac', '1', wav_path],
+                            capture_output=True, timeout=15
+                        )
+                        converted = result.returncode == 0
+                    except Exception:
+                        converted = False
+
+                try:
+                    target = wav_path if converted else src_path
+                    with sr.AudioFile(target) as source:
+                        audio_data = recognizer.record(source)
+                    text = recognizer.recognize_google(audio_data)
+                    logger.info(f"SpeechRecognition transcript: {text[:80]}")
+                    return {"success": True, "text": text, "engine": "google_sr"}
+                except sr.UnknownValueError:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"success": False, "error": "Could not understand audio. Please speak clearly and try again."}
+                    )
+                except sr.RequestError as e:
+                    return JSONResponse(
+                        status_code=503,
+                        content={"success": False, "error": f"Google Speech API error: {str(e)}"}
+                    )
+                finally:
+                    for p in [src_path, wav_path]:
+                        try:
+                            if p and os.path.exists(p):
+                                os.unlink(p)
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.error(f"SpeechRecognition fallback failed: {e}")
+
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": "All transcription engines failed. Please type your answer manually."}
+        )
+
+    except Exception as e:
+        logger.error(f"Transcribe endpoint error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+
+
 @app.get("/")
 async def root():
     return {
@@ -753,6 +910,7 @@ async def root():
             "POST /submit_ai_answer": "Submit answer",
             "POST /set_reference_face": "Set reference face",
             "POST /end_ai_interview": "End AI interview",
+            "POST /transcribe": "Transcribe audio to text",
             "GET /frame_status": "Check frame reception",
             "GET /health": "Health check",
             "WS /ws": "WebSocket for video"
